@@ -68,6 +68,6 @@ class RegressionHead(nn.Sequential):
             nn.Dropout(dropout_rate),
             nn.Linear(in_features, hidden_features),
             activation(inplace=True) if activation == nn.ReLU else activation(),
-            nn.Dropout(dropout_rate),
+            nn.SiLU(),
             nn.Linear(hidden_features, out_features)
         )

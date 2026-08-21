@@ -1,4 +1,6 @@
-/data/
+/data/*
 /models/weights/
 /.venv/
 __pycache__/
+/output/*
+evaluation/
