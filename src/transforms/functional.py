@@ -303,7 +303,7 @@ def normalize(img, mean, std, inplace=False):
         Tensor: Normalized Tensor image.
     """
 
-    tensor = to_tensor(img)
+    tensor = img
     if not torch.is_tensor(tensor):
         raise TypeError('tensor should be a torch tensor. Got {}'.format(type(tensor)))
 
@@ -321,7 +321,7 @@ def normalize(img, mean, std, inplace=False):
     if std.ndim == 1:
         std = std.view(-1, 1, 1)
     tensor.sub_(mean).div_(std)
-    return to_pil_image(tensor)
+    return tensor
 
 
 def to_grayscale(img, num_output_channels=1):

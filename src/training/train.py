@@ -30,11 +30,14 @@ def train(epoch, dataloader, net, optimizer, criterion, use_cuda, opt, trial=Non
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
 
-        if targets.dim() == 1:
-            targets = targets.unsqueeze(1)
-
         optimizer.zero_grad()
         outputs = net(inputs)
+
+        if outputs.shape != targets.shape:
+            raise ValueError(
+                "Model outputs and targets must have the same shape, "
+                f"got outputs={tuple(outputs.shape)}, targets={tuple(targets.shape)}"
+            )
 
         loss = torch.nn.L1Loss()(outputs, targets)  # Use L1 loss (Mean Absolute Error) for regression
         loss.backward()
@@ -63,10 +66,13 @@ def evaluate(dataloader, model, criterion, use_cuda, opt, trial=None):
             if use_cuda:
                 inputs, targets = inputs.cuda(), targets.cuda()
 
-            if targets.dim() == 1:
-                targets = targets.unsqueeze(1) 
-
             outputs = model(inputs)
+            if outputs.shape != targets.shape:
+                raise ValueError(
+                    "Model outputs and targets must have the same shape, "
+                    f"got outputs={tuple(outputs.shape)}, targets={tuple(targets.shape)}"
+                )
+
             loss = torch.nn.L1Loss()(outputs, targets)  # Use L1 loss
             
             total_loss += loss.item()
@@ -120,7 +126,7 @@ def run_training(opt, trial=None):
 
     DataLoader._ensure_label_stats(opt.dataset)
     DataLoader._ensure_image_stats(opt.dataset)
-    normalization_mean, normalization_std = DataLoader.label_mean.numpy(), DataLoader.label_std.numpy()
+    normalization_mean, normalization_std = DataLoader.image_mean.numpy(), DataLoader.image_std.numpy()
 
     if data_augmentation:
         transform_list = [
@@ -130,8 +136,8 @@ def run_training(opt, trial=None):
             transforms.RandomHorizontalFlip(),
             transforms.RandomRotation(degrees=rotation),
             transforms.RandomShift(shift_range=(hor_shift, ver_shift)),
-            transforms.Normalize(mean=normalization_mean, std=normalization_std),
-            transforms.ToTensor()
+            transforms.ToTensor(),
+            transforms.Normalize(mean=normalization_mean, std=normalization_std)
         ]
 
         train_transform = transforms.Compose(transform_list)
@@ -139,15 +145,15 @@ def run_training(opt, trial=None):
         train_transform = transforms.Compose([
             transforms.Resize((input_size, input_size)),
             transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
-            transforms.Normalize(mean=normalization_mean, std=normalization_std),
-            transforms.ToTensor()
+            transforms.ToTensor(),
+            transforms.Normalize(mean=normalization_mean, std=normalization_std)
         ])
 
     val_transform = transforms.Compose([
         transforms.Resize((input_size, input_size)),
             transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
-        transforms.Normalize(mean=normalization_mean, std=normalization_std),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        transforms.Normalize(mean=normalization_mean, std=normalization_std)
     ])
 
     train_dataset = DataLoader(dataset=opt.dataset, split="Train", transform=train_transform)

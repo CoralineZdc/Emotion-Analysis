@@ -219,7 +219,6 @@ class DataLoader(data.Dataset):
         if not isinstance(target, torch.Tensor):
             target = torch.tensor(target, dtype=torch.float32)
 
-        target = target.unsqueeze(0) 
         return img, target
 
 
