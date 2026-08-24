@@ -8,7 +8,7 @@ import optuna
 
 from src.utils.training_utils import *
 from src.utils.data_loader import DataLoader
-from src.transforms import transforms 
+import src.transforms.transforms as transforms
 
 
 def save_checkpoint(state, filename):
@@ -45,10 +45,16 @@ def train(epoch, dataloader, net, optimizer, loss, use_cuda, opt, trial=None):
                 f"got outputs={tuple(outputs.shape)}, targets={tuple(targets.shape)}"
             )
 
-        loss_fct = torch.nn.MSELoss() if opt.loss == "mse" else torch.nn.L1Loss()
+        loss_fct = torch.nn.MSELoss(reduction='none') if opt.loss == "mse" else torch.nn.L1Loss(reduction='none')
         loss = loss_fct(outputs, targets)  # Use the specified loss function
+
+        loss_per_dim = loss_fct(outputs, targets)  # Compute loss per dimension
+        weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=loss_per_dim.device)
+        weighted_loss_per_dim = loss_per_dim * weights / weights.sum()  # Normalize weights to sum to 1
+
+        batch_loss = weighted_loss_per_dim.sum(dim=1).mean()  # Average the weighted loss across dimensions
         orth_loss = compute_orth_loss_model(net)
-        loss = loss + opt.orth_loss_weight * orth_loss
+        loss = batch_loss + opt.orth_loss_weight * orth_loss
 
         all_predictions.append(outputs.detach())
         all_targets.append(targets.detach())
@@ -96,10 +102,13 @@ def evaluate(dataloader, model, loss, use_cuda, opt, trial=None):
                     f"got outputs={tuple(outputs.shape)}, targets={tuple(targets.shape)}"
                 )
 
-            loss_fct = torch.nn.MSELoss() if opt.loss == "mse" else torch.nn.L1Loss()
-            loss = loss_fct(outputs, targets)  # Use the specified loss function
+            loss_fct = torch.nn.MSELoss(reduction='none') if opt.loss == "mse" else torch.nn.L1Loss(reduction='none')
+            loss_per_dim = loss_fct(outputs, targets)  # Use the specified loss function
+            weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=loss_per_dim.device)
+            weighted_loss_per_dim = loss_per_dim * weights / weights.sum()  # Normalize weights to sum to 1
+            batch_loss = weighted_loss_per_dim.sum(dim=1).mean()  # Average the weighted loss across dimensions
 
-            total_loss += loss.item()
+            total_loss += batch_loss.item()
             total_batches += 1
 
             all_predictions.append(outputs.cpu())
@@ -332,6 +341,9 @@ def build_parser():
     parser.add_argument("--model", type=str, default="vgg16", choices=["vgg11", "vgg13", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "efficientnet", "mobilenet", "mobilefacenet"], help="Model architecture to use (default: vgg16)")
     parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay for the optimizer (default: 5e-4)")
     parser.add_argument("--loss", type=str, default="mse", choices=["rmse", "mse"], help="Loss metric to use (default: mse)")
+    parser.add_argument("--weight_V", type=float, default=1.0, help="Weight for the V loss (default: 1.0)")
+    parser.add_argument("--weight_A", type=float, default=1.0, help="Weight for the A loss (default: 1.0)")
+    parser.add_argument("--weight_D", type=float, default=00, help="Weight for the D loss (default: 0.0)")
     parser.add_argument("--orth_loss_weight", type=float, default=0.5, help="Weight for the orthogonality loss (default: 0.5)")
     parser.add_argument("--pretrained", action="store_true", help="Use pretrained weights for the model")
     parser.add_argument("--freezed", action="store_true", help="Freeze the convolutional layers of the model")
