@@ -99,7 +99,7 @@ class MobileFaceNet(Model):
         # Initialize MobileFaceNet backbone
         block = InvertedResidual
         last_channel = 512
-        input_channel = self.first_channel
+        input_channel = self.__first_channel
 
         if self.inverted_residual_setting is None:
             # Configuration originale

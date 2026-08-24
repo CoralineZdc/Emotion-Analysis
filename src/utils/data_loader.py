@@ -159,9 +159,6 @@ class DataLoader(data.Dataset):
 
             try:
                 pixels = list(map(int, pixel_str.split()))
-                if len(pixels) != self.size * self.size:
-                    print("Warning: {} pixel string has incorrect length ({}) for {}x{} image at index {}. Skipping this entry.".format(self.split, len(pixels), self.size, self.size, idx))
-                    continue
             except ValueError:
                 print("Warning: Could not parse {} pixel string '{}' at index {}. Skipping this entry.".format(self.split, pixel_str, idx))
                 continue

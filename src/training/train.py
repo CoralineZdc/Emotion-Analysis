@@ -16,51 +16,48 @@ def save_checkpoint(state, filename):
     torch.save(state, filename)
 
 
-def train(epoch, dataloader, net, optimizer, loss, use_cuda, label_mean, label_std, opt, trial=None):
+def train(epoch, dataloader, net, optimizer, loss, use_cuda, opt, trial=None):
     """Run one training epoch and return the average loss."""
     net.train()
     total_loss = 0.0
     total_batches = 0
-    device = torch.device("cuda" if use_cuda else "cpu")
 
-    label_mean = torch.tensor(label_mean, device=device)
-    label_std = torch.tensor(label_std, device=device)
+    label_mean = DataLoader.label_mean.cuda()
+    label_std = DataLoader.label_std.cuda()
 
     all_predictions = []
     all_targets = []
-
-    weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=device)
 
     print("\nEpoch: {}".format(epoch))
     print("LR: {}".format(optimizer.param_groups[0]["lr"]))
 
     for inputs, targets in dataloader:
         print(f"Training: |{'█'*int((total_batches + 1) / len(dataloader) * 20)}{' '*int(20 - int((total_batches + 1) / len(dataloader) * 20))}| {(total_batches + 1) / len(dataloader) * 100 :.2f}% [{total_batches + 1}/{len(dataloader)}]", end="\r")
-        inputs = inputs.to(device)
-        targets_norm = targets.to(device)
+        if use_cuda:
+            inputs, targets = inputs.cuda(), targets.cuda()
 
         optimizer.zero_grad()
-        outputs_norm = net(inputs)
+        outputs = net(inputs)
 
-        if outputs_norm.shape != targets_norm.shape:
+        if outputs.shape != targets.shape:
             raise ValueError(
                 "Model outputs and targets must have the same shape, "
-                f"got outputs={tuple(outputs_norm.shape)}, targets={tuple(targets_norm.shape)}"
+                f"got outputs={tuple(outputs.shape)}, targets={tuple(targets.shape)}"
             )
 
-        outputs_raw = outputs_norm * label_std + label_mean
-        targets_raw = targets_norm * label_std + label_mean
+        loss_fct = torch.nn.MSELoss(reduction='none') if opt.loss == "mse" else torch.nn.L1Loss(reduction='none')
+        loss = loss_fct(outputs, targets)  # Use the specified loss function
 
-        per_dim_mse = torch.mean((outputs_raw - targets_raw) ** 2, dim=0)
-        regression_loss = torch.sum(weights * per_dim_mse) / torch.sum(weights)
-        regression_loss = torch.sqrt(regression_loss)  if opt.loss == "rmse" else regression_loss
+        loss_per_dim = loss_fct(outputs, targets)  # Compute loss per dimension
+        weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=loss_per_dim.device)
+        weighted_loss_per_dim = loss_per_dim * weights / weights.sum()  # Normalize weights to sum to 1
 
-        orth_loss = 0.0 if opt.orth_loss_weight <= 0.0 else compute_orth_loss_model(net)
+        batch_loss = weighted_loss_per_dim.sum(dim=1).mean()  # Average the weighted loss across dimensions
+        orth_loss = compute_orth_loss_model(net)
+        loss = batch_loss + opt.orth_loss_weight * orth_loss
 
-        loss = regression_loss + opt.orth_loss_weight * orth_loss
-
-        all_predictions.append(outputs_raw.detach())
-        all_targets.append(targets_raw.detach())
+        all_predictions.append(outputs.detach())
+        all_targets.append(targets.detach())
 
         loss.backward()
 
@@ -71,10 +68,13 @@ def train(epoch, dataloader, net, optimizer, loss, use_cuda, label_mean, label_s
         total_loss += loss.item()
         total_batches += 1
 
-    preds_raw = torch.cat(all_predictions, dim=0)
-    targets_raw = torch.cat(all_targets, dim=0)
+    preds_cat = torch.cat(all_predictions, dim=0)
+    targets_cat = torch.cat(all_targets, dim=0)
 
-    rmse_per_dim = torch.sqrt(torch.mean((preds_raw - targets_raw) ** 2, dim=0)).cpu().numpy()
+    #preds_raw = preds_cat * label_std + label_mean
+    #targets_raw = targets_cat * label_std + label_mean
+
+    rmse_per_dim = torch.sqrt(torch.mean((preds_cat - targets_cat) ** 2, dim=0)).cpu().numpy()
 
 
     avg_loss = total_loss / max(total_batches, 1)
@@ -83,55 +83,57 @@ def train(epoch, dataloader, net, optimizer, loss, use_cuda, label_mean, label_s
     return avg_loss, rmse_per_dim
 
 
-def evaluate(dataloader, model, loss, use_cuda, label_mean, label_std, opt, trial=None):
+def evaluate(dataloader, model, loss, use_cuda, opt, trial=None):
     model.eval()
     total_loss = 0.0
     total_batches = 0
     all_predictions = []
     all_targets = []
-    device = torch.device("cuda" if use_cuda else "cpu")
-
-    label_mean = torch.tensor(label_mean, device=device)
-    label_std = torch.tensor(label_std, device=device)
-
-    weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=device)
 
     with torch.no_grad():
         for inputs, targets in dataloader:
-            inputs, targets_norm = inputs.to(device), targets.to(device)
+            if use_cuda:
+                inputs, targets = inputs.cuda(), targets.cuda()
 
-            outputs_norm = model(inputs)
-            if outputs_norm.shape != targets_norm.shape:
+            outputs = model(inputs)
+            if outputs.shape != targets.shape:
                 raise ValueError(
                     "Model outputs and targets must have the same shape, "
-                    f"got outputs={tuple(outputs_norm.shape)}, targets={tuple(targets_norm.shape)}"
+                    f"got outputs={tuple(outputs.shape)}, targets={tuple(targets.shape)}"
                 )
 
-            outputs_raw = outputs_norm * label_std + label_mean
-            targets_raw = targets_norm * label_std + label_mean
+            loss_fct = torch.nn.MSELoss(reduction='none') if opt.loss == "mse" else torch.nn.L1Loss(reduction='none')
+            loss_per_dim = loss_fct(outputs, targets)  # Use the specified loss function
+            weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=loss_per_dim.device)
+            weighted_loss_per_dim = loss_per_dim * weights / weights.sum()  # Normalize weights to sum to 1
+            batch_loss = weighted_loss_per_dim.sum(dim=1).mean()  # Average the weighted loss across dimensions
 
-            per_dim_mse = torch.mean((outputs_raw - targets_raw) ** 2, dim=0)
-            loss = torch.sum(weights * per_dim_mse) / torch.sum(weights)
-            loss = torch.sqrt(loss) if opt.loss == "rmse" else loss
-
-            total_loss += loss.item()
+            total_loss += batch_loss.item()
             total_batches += 1
 
-            all_predictions.append(outputs_raw)
-            all_targets.append(targets_raw)
+            all_predictions.append(outputs.cpu())
+            all_targets.append(targets.cpu())
 
     avg_loss = total_loss / max(total_batches, 1)
 
-    all_predictions = torch.cat(all_predictions, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
+    predictions = np.concatenate(
+        [np.asarray(batch) for batch in all_predictions],
+        axis=0,
+    )
+    targets = np.concatenate(
+        [np.asarray(batch) for batch in all_targets],
+        axis=0,
+    )
 
-    if all_predictions.shape != all_targets.shape:
+    if predictions.shape != targets.shape:
         raise ValueError(
             f"Prediction/target shape mismatch: "
-            f"{all_predictions.shape} != {all_targets.shape}"
+            f"{predictions.shape} != {targets.shape}"
         )
 
-    rmse_per_dim = torch.sqrt(torch.mean((all_predictions - all_targets) ** 2, dim=0)).cpu().numpy()
+    rmse_per_dim = np.sqrt(
+        np.mean((predictions - targets) ** 2, axis=0)
+    )
 
     return avg_loss, rmse_per_dim
 
@@ -139,10 +141,12 @@ def evaluate(dataloader, model, loss, use_cuda, label_mean, label_std, opt, tria
 def run_training(opt, trial=None):
     set_seed(opt.seed)
 
+    input_size = 48
+
     DataLoader.set_data_protocol("small_split")
     print("[Small Split] Using current extracted CSVs in ./data")
 
-    use_cuda = torch.cuda.is_available() and opt.cuda
+    use_cuda = torch.cuda.is_available()
     if opt.cuda and not use_cuda:
         print("[Warning] --cuda was requested but CUDA is not available. Falling back to CPU.")
 
@@ -170,9 +174,8 @@ def run_training(opt, trial=None):
 
     DataLoader._ensure_label_stats(opt.dataset)
     DataLoader._ensure_image_stats(opt.dataset)
-    normalization_mean, normalization_std = ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) if pretrain_dataset_name == "ms1m" else (DataLoader.image_mean.numpy().tolist(), DataLoader.image_std.numpy().tolist())
+    normalization_mean, normalization_std = DataLoader.image_mean.numpy(), DataLoader.image_std.numpy()
 
-    input_size = 112 if pretrain_dataset_name == "ms1m" else 48
     cut_size = 44
 
     if data_augmentation:
@@ -180,25 +183,25 @@ def run_training(opt, trial=None):
             transforms.RandomCrop(cut_size),
             transforms.RandomHorizontalFlip(),
             transforms.Resize((input_size, input_size)),
-            #transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
+            transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
             transforms.ToTensor(),
-            transforms.Normalize(mean=normalization_mean, std=normalization_std)
+            #transforms.Normalize(mean=normalization_mean, std=normalization_std)
         ]
 
         train_transform = transforms.Compose(transform_list)
     else:
         train_transform = transforms.Compose([
             transforms.Resize((input_size, input_size)),
-            #transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
+            transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
             transforms.ToTensor(),
-            transforms.Normalize(mean=normalization_mean, std=normalization_std)
+            #transforms.Normalize(mean=normalization_mean, std=normalization_std)
         ])
 
     val_transform = transforms.Compose([
         transforms.Resize((input_size, input_size)),
         transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
         transforms.ToTensor(),
-        transforms.Normalize(mean=normalization_mean, std=normalization_std)
+        #transforms.Normalize(mean=normalization_mean, std=normalization_std)
     ])
 
     train_dataset = DataLoader(dataset=opt.dataset, split="Train", transform=train_transform)
@@ -276,8 +279,8 @@ def run_training(opt, trial=None):
             writer.writerow(["epoch", "train_loss", "V_train_rmse", "A_train_rmse", "D_train_rmse", "val_loss", "V_val_rmse", "A_val_rmse", "D_val_rmse"])
 
     for epoch in range(start_epoch, total_epoch):
-        train_loss, train_rmse_per_dim = train(epoch, trainloader, model, optimizer, opt.loss, use_cuda, normalization_mean, normalization_std, opt, trial)
-        val_loss, val_rmse_per_dim = evaluate(valloader, model, opt.loss, use_cuda, normalization_mean, normalization_std, opt, trial)
+        train_loss, train_rmse_per_dim = train(epoch, trainloader, model, optimizer, opt.loss, use_cuda, opt, trial)
+        val_loss, val_rmse_per_dim = evaluate(valloader, model, opt.loss, use_cuda, opt, trial)
 
         print("Validation Loss: {:.4f}".format(val_loss))
         print(f"   Valence RMSE: {val_rmse_per_dim[0]:.4f}, Arousal RMSE: {val_rmse_per_dim[1]:.4f}, Dominance RMSE: {val_rmse_per_dim[2]:.4f}")

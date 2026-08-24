@@ -195,11 +195,3 @@ def compute_orth_loss_model(model):
             loss += orth_dist(param)
 
     return loss
-
-
-class RMSELoss(torch.nn.Module):
-    def __init__(self, reduction='mean'):
-        super(RMSELoss, self).__init__(reduction=reduction)
-
-    def forward(self, y_pred, y_true):
-        return torch.sqrt(torch.mean((y_pred - y_true) ** 2))
