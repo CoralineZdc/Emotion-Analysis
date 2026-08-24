@@ -26,7 +26,12 @@ class Compose(object):
 
     def __call__(self, img):
         for t in self.transforms:
-            img = t(img)
+            # TenCrop/FiveCrop return multiple images. Apply all subsequent
+            # transforms independently to each crop.
+            if isinstance(img, (tuple, list)):
+                img = tuple(t(crop) for crop in img)
+            else:
+                img = t(img)
         return img
     
 
@@ -248,6 +253,79 @@ class RandomResizedCrop(object):
         """
         i, j, h, w = self.get_params(img, self.scale, self.ratio)
         return functional.resized_crop(img, i, j, h, w, self.size, self.interpolation)
+
+
+class RandomCrop(object):
+    """Crop the given PIL Image at a random location.
+
+    Args:
+        size (sequence or int): Desired output size of the crop. If size is an int instead of sequence like (h, w), a square crop (size, size) is made.
+    """
+
+    def __init__(self, size, padding=0):
+        if isinstance(size, numbers.Number):
+            self.size = (int(size), int(size))
+        else:
+            self.size = size
+        self.padding = padding
+
+    @staticmethod
+    def get_params(img, output_size):
+        """Get parameters for ``crop`` for a random crop.
+
+        Args:
+            img (PIL Image): Image to be cropped.
+            output_size (tuple): Expected output size of the crop.
+        """
+        w, h = img.size
+        th, tw = output_size
+        if w == tw and h == th:
+            return 0, 0, h, w
+
+        i = random.randint(0, h - th)
+        j = random.randint(0, w - tw)
+        return i, j, th, tw
+
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL Image): Image to be cropped.
+
+        Returns:
+            PIL Image: Randomly cropped image.
+        """
+        if self.padding > 0:
+            img = functional.pad(img, self.padding)
+
+        i, j, h, w = self.get_params(img, self.size)
+        return functional.crop(img, i, j, h, w)
+
+
+class TenCrop(object):
+    """Crop the given PIL Image into four corners and the central crop plus the flipped version of these (horizontal flipping is used by default).
+
+    Args:
+        size (sequence or int): Desired output size of the crop. If size is an int instead of sequence like (h, w), a square crop (size, size) is made.
+        vertical_flip (bool): Use vertical flipping instead of horizontal flipping. Default: False
+    """
+
+    def __init__(self, size, vertical_flip=False):
+        if isinstance(size, numbers.Number):
+            self.size = (int(size), int(size))
+        else:
+            assert len(size) == 2, "Please provide only two dimensions (height, width) for the crop size."
+            self.size = size
+        self.vertical_flip = vertical_flip
+
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL Image): Image to be cropped.
+
+        Returns:
+            list: List of PIL Images: the ten crops.
+        """
+        return functional.ten_crop(img, self.size, self.vertical_flip)
     
 
 class RandomShift(object):

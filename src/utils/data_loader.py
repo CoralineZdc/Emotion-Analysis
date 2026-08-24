@@ -205,6 +205,10 @@ class DataLoader(data.Dataset):
             self.val_data = self.images
             self.val_labels = self.labels
 
+        raw_labels = np.array(processed_labels) # Before normalization
+        print(f"[{self.split}] Raw Mean (V,A,D): {raw_labels.mean(axis=0)}                 ")
+        print(f"[{self.split}] Raw Std  (V,A,D): {raw_labels.std(axis=0)}                  ")
+
         print("Finished processing {} data. Total valid samples: {}          ".format(self.split, len(self.images)))
 
 
@@ -215,6 +219,12 @@ class DataLoader(data.Dataset):
         img = Image.fromarray(self.images[index])
         if self.transform is not None:
             img = self.transform(img)
+        if isinstance(img, (tuple, list)):
+            # Multi-crop transforms such as TenCrop return one tensor per
+            # crop. Stack them so DataLoader produces [B, crops, C, H, W].
+            if not all(isinstance(crop, torch.Tensor) for crop in img):
+                raise TypeError("Multi-crop transforms must return tensors")
+            img = torch.stack(tuple(img))
         target = self.labels[index]
         if not isinstance(target, torch.Tensor):
             target = torch.tensor(target, dtype=torch.float32)

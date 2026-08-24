@@ -5,6 +5,8 @@ from PIL import Image, ImageOps, ImageEnhance, ImageChops
 import torch
 import numpy as np
 from collections.abc import Iterable
+import numbers
+import collections
 
 try:
     import accimage
@@ -283,6 +285,137 @@ def shift(img, x_shift, y_shift):
         raise TypeError('img should be PIL Image. Got {}'.format(type(img)))
 
     return ImageChops.offset(img, x_shift, y_shift)
+
+
+def pad(img, padding, fill=0):
+    """Pad the given PIL Image on all sides with the given "pad" value.
+
+    Args:
+        img (PIL Image): Image to be padded.
+        padding (int or tuple): Padding on each border. If a single int is provided this
+            is used to pad all borders. If tuple of length 2 is provided this is the padding
+            on left/right and top/bottom respectively. If a tuple of length 4 is provided
+            this is the padding for the left, top, right and bottom borders respectively.
+        fill: Pixel fill value for constant fill. Default is 0. If a tuple of length 3,
+            it is used to fill R, G, B channels respectively.
+
+    Returns:
+        PIL Image: Padded image.
+    """
+    if not _is_pil_image(img):
+        raise TypeError('img should be PIL Image. Got {}'.format(type(img)))
+
+    if not isinstance(padding, (numbers.Number, tuple)):
+        raise TypeError('Got inappropriate padding arg: {}'.format(padding))
+    if not isinstance(fill, (numbers.Number, str, tuple)):
+        raise TypeError('Got inappropriate fill arg: {}'.format(fill))
+
+    if isinstance(padding, collections.Sequence) and len(padding) not in [2, 4]:
+        raise ValueError("Padding must be an int or a 2, or 4 element tuple, not a " +
+                         "{} element tuple".format(len(padding)))
+
+    return ImageOps.expand(img, border=padding, fill=fill)
+
+
+def vflip(img):
+    """Vertically flip the given PIL Image.
+
+    Args:
+        img (PIL Image): Image to be flipped.
+
+    Returns:
+        PIL Image:  Vertically flipped image.
+    """
+    if not _is_pil_image(img):
+        raise TypeError('img should be PIL Image. Got {}'.format(type(img)))
+
+    return img.transpose(Image.FLIP_TOP_BOTTOM)
+
+
+def hflip(img):
+    """Horizontally flip the given PIL Image.
+
+    Args:
+        img (PIL Image): Image to be flipped.
+
+    Returns:
+        PIL Image:  Horizontally flipped image.
+    """
+    if not _is_pil_image(img):
+        raise TypeError('img should be PIL Image. Got {}'.format(type(img)))
+
+    return img.transpose(Image.FLIP_LEFT_RIGHT)
+
+
+def center_crop(img, output_size):
+    if isinstance(output_size, numbers.Number):
+        output_size = (int(output_size), int(output_size))
+    w, h = img.size
+    th, tw = output_size
+    i = int(round((h - th) / 2.))
+    j = int(round((w - tw) / 2.))
+    return crop(img, i, j, th, tw)
+
+
+def five_crop(img, size):
+    """Crop the given PIL Image into four corners and the central crop.
+
+    .. note::
+        This transform returns a list of images and not a single image.
+    Args:
+        img (PIL Image): Image to be cropped.
+        size (sequence or int): Desired output size of the crop. If size is an int instead of sequence like (h, w), a square crop (size, size) is made. 
+    Returns:
+        list: List of cropped PIL Images.
+    """
+    if isinstance(size, int):
+        size = (int(size), int(size))
+    else:
+        assert len(size) == 2, "Please provide only two dimensions (h, w) for size."
+
+    w, h = img.size
+    crop_h, crop_w = size
+    if w < crop_w or h < crop_h:
+        raise ValueError("Requested crop size {} is bigger than input image size {}".format(size, (h, w)))
+
+    tl = img.crop((0, 0, crop_w, crop_h))
+    tr = img.crop((w - crop_w, 0, w, crop_h))
+    bl = img.crop((0, h - crop_h, crop_w, h))
+    br = img.crop((w - crop_w, h - crop_h, w, h))
+    center = center_crop(img, (crop_h, crop_w))
+    return (tl, tr, bl, br, center)
+
+
+def ten_crop(img, size, vertical_flip=False):
+    """Crop the given PIL Image into four corners and the central crop plus the flipped version of these (horizontal flipping is used by default) to produce 10 cropped images.
+
+    .. note::
+        This transform returns a list of images and not a single image. 
+    Args:
+        img (PIL Image): Image to be cropped.
+        size (sequence or int): Desired output size of the crop. If size is an int instead of sequence like (h, w), a square crop (size, size) is made.
+    Returns:
+        list: List of cropped PIL Images.
+    """
+    if isinstance(size, int):
+        size = (int(size), int(size))
+    else:
+        assert len(size) == 2, "Please provide only two dimensions (h, w) for size."
+
+    if isinstance(size, numbers.Number):
+        size = (int(size), int(size))
+    else:
+        assert len(size) == 2, "Please provide only two dimensions (h, w) for size."
+
+    first_five = five_crop(img, size)
+
+    if vertical_flip:
+        img = vflip(img)
+    else:
+        img = hflip(img)
+
+    second_five = five_crop(img, size)
+    return first_five + second_five
 
 
 def normalize(img, mean, std, inplace=False):
