@@ -3,4 +3,4 @@
 /.venv/
 __pycache__/
 /output/*
-evaluation/
+evaluation/plot_loss.py
