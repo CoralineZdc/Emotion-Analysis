@@ -163,10 +163,6 @@ class DataLoader(data.Dataset):
                 print("Warning: Could not parse {} pixel string '{}' at index {}. Skipping this entry.".format(self.split, pixel_str, idx))
                 continue
 
-            #if len(pixels) != 224 * 224:
-            #    print("Warning: {} pixel string has incorrect length ({}) for 224x224 image at index {}. Skipping this entry.".format(self.split, len(pixels), idx))
-            #    continue
-
             label_values = [
                 valence_series.iloc[idx],
                 arousal_series.iloc[idx],
@@ -192,8 +188,8 @@ class DataLoader(data.Dataset):
             )
 
         self.images = processed_images
-        labels = torch.tensor(processed_labels, dtype=torch.float32)
-        self.labels = (labels - self.label_mean) / self.label_std
+        self.labels = torch.tensor(processed_labels, dtype=torch.float32)
+        #self.labels = (labels - self.label_mean) / self.label_std  # Uncomment this line if you want to normalize the labels
 
         if self.split == "Train":
             self.train_data = self.images
@@ -208,23 +204,13 @@ class DataLoader(data.Dataset):
         raw_labels = np.array(processed_labels) # Before normalization
         print(f"[{self.split}] Raw Mean (V,A,D): {raw_labels.mean(axis=0)}                 ")
         print(f"[{self.split}] Raw Std  (V,A,D): {raw_labels.std(axis=0)}                  ")
-
         print("Finished processing {} data. Total valid samples: {}          ".format(self.split, len(self.images)))
-
-
-
-
 
     def __getitem__(self, index):
         img = Image.fromarray(self.images[index])
         if self.transform is not None:
             img = self.transform(img)
-        if isinstance(img, (tuple, list)):
-            # Multi-crop transforms such as TenCrop return one tensor per
-            # crop. Stack them so DataLoader produces [B, crops, C, H, W].
-            if not all(isinstance(crop, torch.Tensor) for crop in img):
-                raise TypeError("Multi-crop transforms must return tensors")
-            img = torch.stack(tuple(img))
+            
         target = self.labels[index]
         if not isinstance(target, torch.Tensor):
             target = torch.tensor(target, dtype=torch.float32)

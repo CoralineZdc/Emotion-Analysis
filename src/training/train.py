@@ -21,9 +21,11 @@ def train(epoch, dataloader, net, optimizer, loss, use_cuda, opt, trial=None):
     net.train()
     total_loss = 0.0
     total_batches = 0
+    device = torch.device("cuda" if use_cuda else "cpu")
 
-    label_mean = DataLoader.label_mean.cuda()
-    label_std = DataLoader.label_std.cuda()
+    weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=device)
+    if weights.sum() == 0:
+        raise ValueError("All weights for V, A, D are zero. At least one must be non-zero.")
 
     all_predictions = []
     all_targets = []
@@ -46,10 +48,8 @@ def train(epoch, dataloader, net, optimizer, loss, use_cuda, opt, trial=None):
             )
 
         loss_fct = torch.nn.MSELoss(reduction='none') if opt.loss == "mse" else torch.nn.L1Loss(reduction='none')
-        loss = loss_fct(outputs, targets)  # Use the specified loss function
+        loss_per_dim = loss_fct(outputs, targets)  # Use the specified loss function
 
-        loss_per_dim = loss_fct(outputs, targets)  # Compute loss per dimension
-        weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=loss_per_dim.device)
         weighted_loss_per_dim = loss_per_dim * weights / weights.sum()  # Normalize weights to sum to 1
 
         batch_loss = weighted_loss_per_dim.sum(dim=1).mean()  # Average the weighted loss across dimensions
@@ -71,8 +71,8 @@ def train(epoch, dataloader, net, optimizer, loss, use_cuda, opt, trial=None):
     preds_cat = torch.cat(all_predictions, dim=0)
     targets_cat = torch.cat(all_targets, dim=0)
 
-    #preds_raw = preds_cat * label_std + label_mean
-    #targets_raw = targets_cat * label_std + label_mean
+    #preds_raw = preds_cat * label_std + label_mean #Uncomment this line if you want to denormalize the predictions
+    #targets_raw = targets_cat * label_std + label_mean #Uncomment this line if you want to denormalize the targets
 
     rmse_per_dim = torch.sqrt(torch.mean((preds_cat - targets_cat) ** 2, dim=0)).cpu().numpy()
 
@@ -85,15 +85,18 @@ def train(epoch, dataloader, net, optimizer, loss, use_cuda, opt, trial=None):
 
 def evaluate(dataloader, model, loss, use_cuda, opt, trial=None):
     model.eval()
+    device = torch.device("cuda" if use_cuda else "cpu")
     total_loss = 0.0
     total_batches = 0
     all_predictions = []
     all_targets = []
 
+    weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=device)
+
     with torch.no_grad():
         for inputs, targets in dataloader:
             if use_cuda:
-                inputs, targets = inputs.cuda(), targets.cuda()
+                inputs, targets = inputs.to(device), targets.to(device)
 
             outputs = model(inputs)
             if outputs.shape != targets.shape:
@@ -104,7 +107,6 @@ def evaluate(dataloader, model, loss, use_cuda, opt, trial=None):
 
             loss_fct = torch.nn.MSELoss(reduction='none') if opt.loss == "mse" else torch.nn.L1Loss(reduction='none')
             loss_per_dim = loss_fct(outputs, targets)  # Use the specified loss function
-            weights = torch.tensor([opt.weight_V, opt.weight_A, opt.weight_D], device=loss_per_dim.device)
             weighted_loss_per_dim = loss_per_dim * weights / weights.sum()  # Normalize weights to sum to 1
             batch_loss = weighted_loss_per_dim.sum(dim=1).mean()  # Average the weighted loss across dimensions
 
@@ -115,26 +117,10 @@ def evaluate(dataloader, model, loss, use_cuda, opt, trial=None):
             all_targets.append(targets.cpu())
 
     avg_loss = total_loss / max(total_batches, 1)
+    predictions = torch.cat(all_predictions, dim=0).numpy()
+    targets = torch.cat(all_targets, dim=0).numpy()
 
-    predictions = np.concatenate(
-        [np.asarray(batch) for batch in all_predictions],
-        axis=0,
-    )
-    targets = np.concatenate(
-        [np.asarray(batch) for batch in all_targets],
-        axis=0,
-    )
-
-    if predictions.shape != targets.shape:
-        raise ValueError(
-            f"Prediction/target shape mismatch: "
-            f"{predictions.shape} != {targets.shape}"
-        )
-
-    rmse_per_dim = np.sqrt(
-        np.mean((predictions - targets) ** 2, axis=0)
-    )
-
+    rmse_per_dim = np.sqrt(np.mean((predictions - targets) ** 2, axis=0))
     return avg_loss, rmse_per_dim
 
 
@@ -174,7 +160,7 @@ def run_training(opt, trial=None):
 
     DataLoader._ensure_label_stats(opt.dataset)
     DataLoader._ensure_image_stats(opt.dataset)
-    normalization_mean, normalization_std = DataLoader.image_mean.numpy(), DataLoader.image_std.numpy()
+    normalization_mean, normalization_std = (DataLoader.image_mean.numpy(), DataLoader.image_std.numpy()) if not pretrain_dataset_name == "ms1m" else (np.array([0.5, 0.5, 0.5]), np.array([0.5, 0.5, 0.5]))
 
     cut_size = 44
 
@@ -183,25 +169,25 @@ def run_training(opt, trial=None):
             transforms.RandomCrop(cut_size),
             transforms.RandomHorizontalFlip(),
             transforms.Resize((input_size, input_size)),
-            transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
+            #transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
             transforms.ToTensor(),
-            #transforms.Normalize(mean=normalization_mean, std=normalization_std)
+            transforms.Normalize(mean=normalization_mean, std=normalization_std)
         ]
 
         train_transform = transforms.Compose(transform_list)
     else:
         train_transform = transforms.Compose([
             transforms.Resize((input_size, input_size)),
-            transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
+            #transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
             transforms.ToTensor(),
-            #transforms.Normalize(mean=normalization_mean, std=normalization_std)
+            transforms.Normalize(mean=normalization_mean, std=normalization_std)
         ])
 
     val_transform = transforms.Compose([
         transforms.Resize((input_size, input_size)),
-        transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
+        #transforms.GrayScale(num_output_channels=3) if opt.pretrained and opt.model != "efficientnet" else lambda x: x,
         transforms.ToTensor(),
-        #transforms.Normalize(mean=normalization_mean, std=normalization_std)
+        transforms.Normalize(mean=normalization_mean, std=normalization_std)
     ])
 
     train_dataset = DataLoader(dataset=opt.dataset, split="Train", transform=train_transform)
@@ -332,7 +318,7 @@ def run_training(opt, trial=None):
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--dataset", type=str, default="fer", choices=["fer"], help="Dataset name (default: fer)")
+    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers"], help="Dataset name (default: fer)")
     parser.add_argument("--early_stopping_patience", type=int, default=20, help="Number of epochs to wait for improvement before early stopping")
     parser.add_argument("--output_dir", type=str, default="./output", help="Directory to save checkpoints and logs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training (default: 32)")

@@ -35,7 +35,7 @@ def get_simu_params(state_dict_path):
     return params
 
 
-def evaluate_vad(dataloader, model, label_mean, label_std, device):
+def evaluate_vad(dataloader, model, device):
     model.eval()
     total_loss = 0.0
     total_batches = 0
@@ -54,20 +54,20 @@ def evaluate_vad(dataloader, model, label_mean, label_std, device):
                 end="\r"
             )
 
-            inputs, targets_norm = inputs.to(device), targets.to(device)
-            outputs_norm = model(inputs)
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
 
-            if outputs_norm.shape != targets_norm.shape:
+            if outputs.shape != targets.shape:
                 raise ValueError(
-                    f"Formes incompatibles entre sorties {tuple(outputs_norm.shape)} "
+                    f"Formes incompatibles entre sorties {tuple(outputs.shape)} "
                     f"et cibles {tuple(targets.shape)}"
                 )
 
-            outputs_raw = outputs_norm * label_std + label_mean
-            targets_raw = targets_norm * label_std + label_mean
+            #outputs_raw = outputs * label_std + label_mean
+            #targets_raw = targets * label_std + label_mean
 
-            all_predictions.append(outputs_raw)
-            all_targets.append(targets_raw)
+            all_predictions.append(outputs)
+            all_targets.append(targets)
 
             total_batches += 1
 
@@ -100,13 +100,13 @@ def main():
 
     # Configuration du protocole et des statistiques des labels
     DataLoader.set_data_protocol("small_split")
-    DataLoader._ensure_label_stats(args.dataset)
+    DataLoader._ensure_image_stats(args.dataset)
 
-    label_mean = DataLoader.label_mean if not "pretrained" in args.state_dict_path else np.array([0.5, 0.5, 0.5])
-    label_std = DataLoader.label_std if not "pretrained" in args.state_dict_path else np.array([0.5, 0.5, 0.5])
+    normalization_mean = DataLoader.image_mean if not "pretrained" in args.state_dict_path else np.array([0.5, 0.5, 0.5])
+    normalization_std = DataLoader.image_std if not "pretrained" in args.state_dict_path else np.array([0.5, 0.5, 0.5])
 
-    label_mean = torch.tensor(label_mean, dtype=torch.float32, device=device)
-    label_std = torch.tensor(label_std, dtype=torch.float32, device=device)
+    normalization_mean = torch.tensor(normalization_mean, dtype=torch.float32, device=device)
+    normalization_std = torch.tensor(normalization_std, dtype=torch.float32, device=device)
 
     state_dict_path = args.state_dict_path
     if not os.path.isabs(state_dict_path):
@@ -131,13 +131,13 @@ def main():
     test_transform = transforms.Compose([
         transforms.Resize((args.input_size, args.input_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=label_mean.tolist(), std=label_std.tolist())
+        transforms.Normalize(mean=normalization_mean.tolist(), std=normalization_std.tolist())
     ])
 
     dataset = DataLoader(split=args.split, dataset=args.dataset, transform=test_transform)
     test_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    avg_loss, mse_per_dim, rmse_per_dim = evaluate_vad(test_loader, model, label_mean, label_std, device=device)
+    avg_loss, mse_per_dim, rmse_per_dim = evaluate_vad(test_loader, model, device=device)
 
     print(f"\n=== Résultats d'évaluation sur '{args.split}' ===")
     print(f"MSE globale moyenne : {avg_loss:.4f}\n")
