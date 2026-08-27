@@ -22,7 +22,7 @@ Options:
 ```bash
   -h, --help            show this help message and exit
   --seed SEED           Random seed for reproducibility
-  --dataset {fer}
+  --dataset {fer,caers}
                         Dataset name (default: fer)
   --early_stopping_patience EARLY_STOPPING_PATIENCE
                         Number of epochs to wait for improvement before early stopping
@@ -33,24 +33,27 @@ Options:
   --epochs EPOCHS       Number of epochs to train (default: 100)
   --learning_rate LEARNING_RATE
                         Learning rate for the optimizer (default: 0.001)
+  --weight_decay WEIGHT_DECAY
+                        Weight decay for the optimizer (default: 5e-4)
   --model {vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,efficientnet,mobilenet,mobilefacenet}
                         Model architecture to use (default: vgg16)
   --pretrained          Use pretrained weights for the model
   --freezed             Freeze the convolutional layers of the model
-  --num_outputs NUM_OUTPUTS
-                        Number of outputs for the regression head (default: 3)
   --dropout_rate DROPOUT_RATE
                         Dropout rate for the regression head (default: 0.5)
   --optimizer {adam,sgd,adamw}
                         Optimizer to use (default: adam)
-  --cuda                Use CUDA for training if available
+  --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
   --grad_clip GRAD_CLIP
                         Gradient clipping value (default: 0.0, no clipping)
-  --data_augmentation_param DATA_AUGMENTATION_PARAM
-                        Data augmentation parameter for rotation (degrees), scaling (percent), and shifting (percent) (default: 5)
+  --data_augmentation   Enable data augmentation
   --resume              Resume training from the last checkpoint if available
   --no_checkpoint       Disable checkpoint saving
   --no_model_save       Disable model saving
+  --weights_VAD WEIGHTS_VAD
+                        Weights for the V, A, and D losses (default: [1.0, 1.0, 1.0])
+  --orth_loss_weight ORTH_LOSS_WEIGHT
+                        Weight for the orthogonality loss (default: 0.5)
   --lr_factor LR_FACTOR
                         Factor by which to reduce learning rate (default: 0.1)
   --lr_patience LR_PATIENCE
@@ -62,6 +65,29 @@ Options:
   --lr_cooldown LR_COOLDOWN
                         Number of epochs to wait before resuming normal operation after reducing learning rate (default: 0)
   --lr_min LR_MIN       Minimum learning rate (default: 0.0)
+```
+
+3.Evaluate a model
+
+```bash  
+python -m src.evaluation.evaluation
+```
+
+Options:
+
+```bash  
+  -h, --help            show this help message and exit
+  --model MODEL         Model architecture.
+  --input-size INPUT_SIZE
+                        Image resolution.
+  --device DEVICE       Device.
+  --dataset DATASET     Dataset name.
+  --split {Test,Val,Train}
+                        Data split.
+  --state-dict-path STATE_DICT_PATH
+                        Path to state dict (.pth).
+  --batch-size BATCH_SIZE
+                        Batch size.
 ```
 
 ## Repository Layout
