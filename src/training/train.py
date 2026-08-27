@@ -12,6 +12,24 @@ import src.utils.transforms as transforms
 from src.evaluation.evaluation import evaluate
 
 
+def parse_weights_vad(value: str) -> list[float]:
+    """Parse three VAD loss weights from one command-line argument."""
+    value = value.strip().strip("[]()")
+    try:
+        weights = [float(weight.strip()) for weight in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "weights_VAD must be three comma-separated numbers, "
+            "for example: 1.0,1.0,1.0"
+        ) from exc
+
+    if len(weights) != 3:
+        raise argparse.ArgumentTypeError(
+            "weights_VAD must contain exactly three values: V, A, and D"
+        )
+    return weights
+
+
 def save_checkpoint(
         state: dict, 
         filename: str
@@ -77,45 +95,6 @@ def train(
 
     return avg_loss, rmse_per_dim
 
-"""
-def evaluate(
-        dataloader: torch.utils.data.DataLoader, 
-        model: torch.nn.Module, 
-        criterion: torch.nn.Module,
-        weights: torch.Tensor,
-        device: torch.device, 
-        label_mean: torch.Tensor, 
-        label_std: torch.Tensor, 
-        trial: optuna.trial.Trial | None = None
-    ) -> tuple[float, np.ndarray]:
-    Evaluate the model on the validation set and return the average loss and RMSE per dimension.
-    model.eval()
-    total_loss = 0.0
-    all_preds, all_targets = [], []
-    num_batches = len(dataloader)
-
-    with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs, targets = inputs.to(device), targets.to(device)
-
-            outputs = model(inputs)
-            if outputs.shape != targets.shape:
-                raise ValueError(f"Shape mismatch: outputs {outputs.shape} vs targets {targets.shape}")
-
-            batch_loss = compute_weighted_loss(outputs, targets, weights, criterion) # Compute the weighted loss across active dimensions
-            total_loss += batch_loss.item()
-
-            all_preds.append(outputs)
-            all_targets.append(targets)
-
-    avg_loss = total_loss / max(num_batches, 1)
-
-    preds_cat = torch.cat(all_preds, dim=0)
-    targets_cat = torch.cat(all_targets, dim=0)
-    rmse_per_dim = compute_unnormlized_rmse(preds_cat, targets_cat, label_mean, label_std)
-
-    return avg_loss, rmse_per_dim
-"""
 
 def run_training(
         opt: argparse.Namespace, 
@@ -334,7 +313,7 @@ def build_parser():
     parser.add_argument("--resume", action="store_true", help="Resume training from the last checkpoint if available")
     parser.add_argument("--no_checkpoint", action="store_true", help="Disable checkpoint saving")
     parser.add_argument("--no_model_save", action="store_true", help="Disable model saving")
-    parser.add_argument("--weights_VAD", type=list, default=[1.0, 1.0, 1.0], help="Weights for the V, A, and D losses (default: [1.0, 1.0, 1.0])")
+    parser.add_argument("--weights_VAD", type=parse_weights_vad, default=[1.0, 1.0, 1.0], help="Weights for the V, A, and D losses (default: 1.0,1.0,1.0)")
     parser.add_argument("--orth_loss_weight", type=float, default=0.5, help="Weight for the orthogonality loss (default: 0.5)")
     parser.add_argument("--lr_factor", type=float, default=0.1, help="Factor by which to reduce learning rate (default: 0.1)")
     parser.add_argument("--lr_patience", type=int, default=10, help="Number of epochs to wait for improvement before reducing learning rate (default: 10)")
