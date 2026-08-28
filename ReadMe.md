@@ -51,7 +51,7 @@ Options:
   --no_checkpoint       Disable checkpoint saving
   --no_model_save       Disable model saving
   --weights_VAD WEIGHTS_VAD
-                        Weights for the V, A, and D losses (default: [1.0, 1.0, 1.0])
+                        Weights for the V, A, and D losses (default: 1.0,1.0,1.0)
   --orth_loss_weight ORTH_LOSS_WEIGHT
                         Weight for the orthogonality loss (default: 0.5)
   --lr_factor LR_FACTOR

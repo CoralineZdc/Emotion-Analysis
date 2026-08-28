@@ -28,7 +28,8 @@ def get_simu_params(state_dict_path):
     for param in dir_name.split("_"):
         idx = next((i for i, c in enumerate(param) if c.isdigit()), len(param))
         key, value = param[:idx], param[idx:]
-        if key: params[key] = value
+        if not value : key, value = param.split("-")
+        if key : params[key] = value
     return params
 
 
@@ -77,13 +78,10 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="VAD Evaluation (MSE & RMSE per dimension).")
-    parser.add_argument("--model", type=str, default="resnet18", help="Model architecture.")
     parser.add_argument("--input-size", type=int, default=48, help="Image resolution.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device.")
-    parser.add_argument("--dataset", type=str, default="fer", help="Dataset name.")
     parser.add_argument("--split", type=str, default="Test", choices=["Test", "Val", "Train"], help="Data split.")
     parser.add_argument("--state-dict-path", type=str, required=True, help="Path to state dict (.pth).")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size.")
 
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -93,33 +91,28 @@ def main():
         state_dict_path = Path(repo_root()) / state_dict_path
 
     simu_params = get_simu_params(state_dict_path)
-    dataset_name = simu_params.get("dataset", args.dataset)
+    dataset_name = simu_params.get("dataset", "fer")
     dropout_rate = float(simu_params.get("dropout", 0.5))
-    
-    weights_list = [float(simu_params.get("V", 1.0)), float(simu_params.get("A", 1.0)), float(simu_params.get("D", 1.0))]
-    include_flags = [w > 0 for w in weights_list]
-    num_outputs = sum(include_flags)
-    weights_list = [w for w, include in zip(weights_list, include_flags) if include]
-    weights = torch.tensor(weights_list, dtype=torch.float32, device=device)
+    batch_size = int(simu_params.get("batch", 64))
 
-    # Set up DataLoader and model
+    # Initialize DataLoader protocol to ensure image and label statistics are computed
     DataLoader.set_data_protocol("small_split")
     DataLoader._ensure_image_stats(dataset_name)
     DataLoader._ensure_label_stats(dataset_name)
 
-    if "pretrained" in args.state_dict_path:
-        image_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=device)
-        image_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=device)
-    else:
-        image_mean = DataLoader.image_mean.to(device, dtype=torch.float32)
-        image_std = DataLoader.image_std.to(device, dtype=torch.float32)
+    # Determine which dimensions to include based on weights and dataset availability
+    weights_list = [float(simu_params.get("V", 1.0)), float(simu_params.get("A", 1.0)), float(simu_params.get("D", 1.0))]
+    include_flags = [(w > 0 and dim in DataLoader.available_columns) for w, dim in zip(weights_list, ["Valence", "Arousal", "Dominance"])]
+    num_outputs = sum(include_flags)
 
-    label_mean = torch.tensor(DataLoader.label_mean, dtype=torch.float32, device=device)
-    label_std = torch.tensor(DataLoader.label_std, dtype=torch.float32, device=device)
+    weights_list = [w for w, include in zip(weights_list, include_flags) if include]
+    weights = torch.tensor(weights_list, dtype=torch.float32, device=device)
 
     #Instanciate model
+    model_name = state_dict_path.parts[-3]  # Assuming the model name is the third last part of the path
+    print(f"Instantiating model {model_name.upper()} with {num_outputs} outputs and dropout rate {dropout_rate}")
     model = load_model(
-        args.model,
+        model_name=model_name,
         num_channels=3,
         num_outputs=num_outputs,
         dropout_rate=dropout_rate
@@ -132,6 +125,14 @@ def main():
     model.load_state_dict(state_dict)
     model.to(device)
 
+    # Determine image normalization parameters based on whether the model is pretrained or not
+    if "pretrained" in args.state_dict_path:
+        image_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=device)
+        image_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=device)
+    else:
+        image_mean = DataLoader.image_mean.to(device, dtype=torch.float32)
+        image_std = DataLoader.image_std.to(device, dtype=torch.float32)
+
     # Evaluation transforms and loader
     test_transform = Compose([
         Resize((args.input_size, args.input_size)),
@@ -140,7 +141,11 @@ def main():
     ])
 
     dataset = DataLoader(split=args.split, dataset=dataset_name, transform=test_transform, include_V=include_flags[0], include_A=include_flags[1], include_D=include_flags[2])
-    test_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    test_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    # Extracting label mean and std for unnormalization
+    label_mean = dataset.active_label_mean.detach().clone().to(dtype=torch.float32, device=device)
+    label_std = dataset.active_label_std.detach().clone().to(dtype=torch.float32, device=device)
 
     # Run evaluation
     avg_loss, rmse_per_dim = evaluate(test_loader, model, weights=weights, label_mean=label_mean, label_std=label_std, device=device)

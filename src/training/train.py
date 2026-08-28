@@ -244,7 +244,7 @@ def run_training(
         # Print epoch summary
         train_str = ", ".join([f"{name} RMSE: {val:.4f}" for name, val in zip(target_names, train_rmse_per_dim)])
         val_str = ", ".join([f"{name} RMSE: {val:.4f}" for name, val in zip(target_names, val_rmse_per_dim)])
-        print(f"Epoch {epoch + 1}/{opt.epochs} | Train Loss: {train_loss:.4f} | {train_str}\nVal Loss: {val_loss:.4f} | {val_str}")
+        print(f"Train Loss: {train_loss:.4f} | {train_str}\nVal Loss: {val_loss:.4f} | {val_str}")
 
         # Update learning rate scheduler and check for early stopping
         scheduler.step(val_loss)
@@ -295,7 +295,7 @@ def run_training(
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers"], help="Dataset name (default: fer)")
+    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew"], help="Dataset name (default: fer)")
     parser.add_argument("--early_stopping_patience", type=int, default=20, help="Number of epochs to wait for improvement before early stopping")
     parser.add_argument("--output_dir", type=str, default="./output", help="Directory to save checkpoints and logs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training (default: 32)")
