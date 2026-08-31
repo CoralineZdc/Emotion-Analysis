@@ -36,6 +36,7 @@ class DataLoader(data.Dataset):
     data_protocol: str = "small_split"
     split_file_overrides: dict[str, str] = {}
     size: int = 48  # Image dimensions
+    num_channels: int = 3  # Number of image channels (1 for pretrained models, 3 for training from scratch)
 
     @classmethod
     def _repo_root(cls) -> str:
@@ -46,6 +47,13 @@ class DataLoader(data.Dataset):
         if protocol not in {"small_split"}:
             raise ValueError("Unknown data protocol: {}".format(protocol))
         cls.data_protocol = protocol
+
+    @classmethod
+    def set_num_channels(cls, num_channels: int):
+        """Set the number of channels for image loading (1 for grayscale, 3 for RGB)."""
+        if num_channels not in {1, 3}:
+            raise ValueError(f"num_channels must be 1 or 3, got {num_channels}")
+        cls.num_channels = num_channels
 
     @classmethod
     def _get_split_candidates(cls, split: str, dataset: str = "fer") -> List[str]:
@@ -151,6 +159,7 @@ class DataLoader(data.Dataset):
         include_A: bool = True,
         include_D: bool = True,
         transform: Optional[Callable] = None,
+        display: bool = True,
     ) -> None:
         super().__init__()
         if split not in {"Train", "Test", "Val"}:
@@ -159,6 +168,7 @@ class DataLoader(data.Dataset):
         self.transform = transform
         self.split = split
         self.dataset = dataset
+        self.display = display
 
         DataLoader._ensure_label_stats(dataset)
         DataLoader._ensure_image_stats(dataset)
@@ -201,6 +211,9 @@ class DataLoader(data.Dataset):
         processed_images = []
         processed_labels = []
         dropped_outliers = 0
+        empty_pixels_count = 0
+        invalid_format_count = 0
+        invalid_len_count = 0
         total_rows = len(data_df)
         expected_length = self.size * self.size
 
@@ -213,18 +226,21 @@ class DataLoader(data.Dataset):
         for idx, row in data_df.iterrows():
             progress = (idx + 1) / total_rows
             bar = "█" * int(progress * 20) + " " * int(20 - int(progress * 20))
-            print(f"Processing {self.split} Data: |{bar}| {idx + 1}/{total_rows} [{progress * 100:.2f}%]", end="\r")
+            print(f"Processing {self.split} Data: |{bar}| {idx + 1}/{total_rows} [{progress * 100:.2f}%]", end="\r") if self.display else None
 
             pixel_str = str(row["pixels"]).strip()
             if not pixel_str or pixel_str.lower() == "nan":
+                empty_pixels_count += 1
                 continue
 
             try:
                 pixels = np.fromstring(pixel_str, dtype=np.uint8, sep=" ")
             except ValueError:
+                invalid_format_count += 1
                 continue
 
             if len(pixels) != expected_length:
+                invalid_len_count += 1
                 continue
 
             label_values = row[active_columns].to_numpy(dtype=np.float32)
@@ -235,12 +251,17 @@ class DataLoader(data.Dataset):
                 continue
 
             arr_2d = pixels.reshape(self.size, self.size)
-            arr_3d = np.stack([arr_2d, arr_2d, arr_2d], axis=2)
-            processed_images.append(arr_3d)
+            # Create 1-channel (grayscale) or 3-channel (RGB) images based on num_channels
+            # PIL needs (H, W) for grayscale or (H, W, 3) for RGB - not (H, W, 1)
+            if self.num_channels == 1:
+                arr_channel = arr_2d  # Keep as (48, 48) for grayscale
+            else:
+                arr_channel = np.stack([arr_2d, arr_2d, arr_2d], axis=2)  # (48, 48) -> (48, 48, 3)
+            processed_images.append(arr_channel)
             processed_labels.append(label_values)
 
-        print(" " * 100, end="\r")
-        if dropped_outliers > 0:
+        print(" " * 100, end="\r") if self.display else None
+        if dropped_outliers > 0 and self.display:
             print(
                 f"[Label Warning] '{self.split}' split: Dropped {dropped_outliers} outlier samples "
                 f"outside [{min_valid}, {max_valid}]."
@@ -251,11 +272,12 @@ class DataLoader(data.Dataset):
         self.labels = (raw_labels - self.active_label_mean) / self.active_label_std
 
         raw_labels_np = np.array(processed_labels)
-        print(f"[{self.split}] Raw Mean ({', '.join(active_columns)}): {raw_labels_np.mean(axis=0)}")
-        print(f"[{self.split}] Raw Std  ({', '.join(active_columns)}): {raw_labels_np.std(axis=0)}")
-        print(f"[{self.split}] Normalized Mean ({', '.join(active_columns)}): {self.labels.mean(dim=0).numpy()}")
-        print(f"[{self.split}] Normalized Std  ({', '.join(active_columns)}): {self.labels.std(dim=0).numpy()}")
-        print(f"Finished processing {self.split} data. Total valid samples: {len(self.images)}")
+        if self.display:
+            print(f"[{self.split}] Raw Mean ({', '.join(active_columns)}): {raw_labels_np.mean(axis=0)}")
+            print(f"[{self.split}] Raw Std  ({', '.join(active_columns)}): {raw_labels_np.std(axis=0)}")
+            print(f"[{self.split}] Normalized Mean ({', '.join(active_columns)}): {self.labels.mean(dim=0).numpy()}")
+            print(f"[{self.split}] Normalized Std  ({', '.join(active_columns)}): {self.labels.std(dim=0).numpy()}")
+            print(f"Finished processing {self.split} data. Total valid samples: {len(self.images)}")
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         img = Image.fromarray(self.images[index])

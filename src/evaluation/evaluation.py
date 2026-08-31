@@ -14,7 +14,7 @@ if project_root not in sys.path:
 
 from src.utils.data_loader import DataLoader
 from src.utils.transforms import Compose, Resize, ToTensor, Normalize
-from src.utils.training_utils import compute_unnormlized_rmse, load_model, compute_weighted_loss
+from src.utils.training_utils import compute_unnormlized_rmse, load_model, compute_batch_loss
 
 
 def repo_root() -> str:
@@ -36,7 +36,8 @@ def get_simu_params(state_dict_path):
 def evaluate(
         dataloader: torch.utils.data.DataLoader, 
         model: torch.nn.Module, 
-        criterion: torch.nn.Module = torch.nn.MSELoss(reduction='none'),
+        criterion_type: str = "mse",
+        alpha: float = 0.5,
         weights: torch.Tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32),
         label_mean: torch.Tensor = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
         label_std: torch.Tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32),
@@ -59,7 +60,7 @@ def evaluate(
             if outputs.shape != targets.shape:
                 raise ValueError(f"Shape mismatch: outputs {outputs.shape} vs targets {targets.shape}")
 
-            batch_loss = compute_weighted_loss(outputs, targets, weights, criterion)
+            batch_loss = compute_batch_loss(outputs, targets, weights, criterion_type, alpha)
             total_loss += batch_loss.item()
             
             all_preds.append(outputs)

@@ -41,7 +41,7 @@ def crop_face_mediapipe(img_pil: Image.Image, face_detector, margin: float = 0.1
 def preprocess_and_split_afew(
     dataset_dir: str = "../Data/VA/AFEW-VA",
     output_dir: str = "./data",
-    target_size: tuple = (48, 48),
+    target_size: tuple = (112, 112),
     min_confidence: float = 0.5,
     seed: int = 42,
 ) -> None:
