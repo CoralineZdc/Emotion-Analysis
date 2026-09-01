@@ -1,12 +1,11 @@
 import argparse
 import csv
 import os
-import random
 import numpy as np
 import optuna
 import torch
 
-from src.evaluation.evaluation import evaluate
+from src.evaluation.test import evaluate
 from src.utils.data_loader import DataLoader
 import src.utils.transforms as transforms
 from src.utils.training_utils import *
@@ -244,13 +243,13 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     for epoch in range(opt.epochs):
         train_loss, train_rmse = train(epoch, trainloader, model, optimizer, weights_tensor, device, opt, label_mean, label_std, trial)
         val_loss, val_rmse = evaluate(valloader, model, opt.criterion, alpha=opt.ccc_weight, weights=weights_tensor, label_mean=label_mean, label_std=label_std, device=device, trial=trial)
+        val_loss_float = float(val_loss.item()) if hasattr(val_loss, "item") else float(val_loss)
 
         if not is_optuna:
             print(f"Train Loss: {train_loss:.4f} | {' | '.join(f'Train RMSE {name}: {rmse:.4f}' for name, rmse in zip(target_names, train_rmse))}")
             print(f"Val Loss: {val_loss:.4f} | {' | '.join(f'Val RMSE {name}: {rmse:.4f}' for name, rmse in zip(target_names, val_rmse))}")
 
-
-        scheduler.step(val_loss)
+        scheduler.step(val_loss_float)
 
         if val_loss < best_score:
             best_score = val_loss
@@ -266,46 +265,46 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
 
         # Optuna Intermediate Pruning Check
         if trial is not None:
-            trial.report(val_loss, epoch)
+            trial.report(val_loss_float, epoch)
             if trial.should_prune():
                 raise optuna.exceptions.TrialPruned()
 
-    return best_score, best_val_rmse, target_names
+    return float(best_score), best_val_rmse, target_names
 
 
 def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew"])
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
+    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew"], help ="Dataset to use for training and evaluation (default: fer)")
     parser.add_argument("--input_size", type=int, default=112, help="Image spatial resolution (default: 112)")
-    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader subprocess workers")
-    parser.add_argument("--early_stopping_patience", type=int, default=20)
-    parser.add_argument("--output_dir", type=str, default="./output")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
-    parser.add_argument("--model", type=str, default="vgg16", choices=["vgg11", "vgg13", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "efficientnet", "mobilenet", "mobilefacenet"])
-    parser.add_argument("--pretrained", action="store_true")
-    parser.add_argument("--freezed", action="store_true")
-    parser.add_argument("--dropout_rate", type=float, default=0.5)
-    parser.add_argument("--optimizer", type=str, default="sgd", choices=["adam", "sgd", "adamw"])
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
-    parser.add_argument("--grad_clip", type=float, default=0.0)
-    parser.add_argument("--data_augmentation", action="store_true")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--no_checkpoint", action="store_true")
-    parser.add_argument("--no_model_save", action="store_true")
-    parser.add_argument("--criterion", type=str, default="mse", choices=["mse", "ccc", "combined"])
-    parser.add_argument("--VAD_weights", type=parse_vad_weights, default=[1.0, 1.0, 1.0])
-    parser.add_argument("--orth_loss_weight", type=float, default=0.5)
-    parser.add_argument("--ccc_weight", type=float, default=0.5)
-    parser.add_argument("--lr_factor", type=float, default=0.1)
-    parser.add_argument("--lr_patience", type=int, default=10)
-    parser.add_argument("--lr_threshold", type=float, default=1e-4)
-    parser.add_argument("--lr_threshold_mode", type=str, default="rel")
-    parser.add_argument("--lr_cooldown", type=int, default=0)
-    parser.add_argument("--lr_min", type=float, default=0.0)
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader subprocess workers (default: 4)")
+    parser.add_argument("--early_stopping_patience", type=int, default=20, help="Number of epochs with no improvement after which training will be stopped (default: 20)")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Directory to save logs and model checkpoints (default: ./output)")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training (default: 32)")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs (default: 100)")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer (default: 1e-4)")
+    parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay for the optimizer (default: 5e-4)")
+    parser.add_argument("--model", type=str, default="vgg16", choices=["vgg11", "vgg13", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "efficientnet", "mobilenet", "mobilefacenet"], help="Model architecture to use (default: vgg16)")
+    parser.add_argument("--pretrained", action="store_true", help="Use pre-trained weights (default: False)")
+    parser.add_argument("--freezed", action="store_true", help="Freeze the convolutional layers of the model (default: False)")
+    parser.add_argument("--dropout_rate", type=float, default=0.5, help="Dropout rate for the regression head (default: 0.5)")
+    parser.add_argument("--optimizer", type=str, default="sgd", choices=["adam", "sgd", "adamw"], help="Optimizer to use for training (default: sgd)")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"], help="Device to use for training (default: cuda if available, otherwise cpu)")
+    parser.add_argument("--grad_clip", type=float, default=0.0, help="Gradient clipping value (default: 0.0, no clipping)")
+    parser.add_argument("--data_augmentation", action="store_true", help="Apply data augmentation during training (default: False)")
+    parser.add_argument("--resume", action="store_true", help="Resume training from a previous checkpoint (default: False)")
+    parser.add_argument("--no_checkpoint", action="store_true", help="Do not save checkpoints (default: False)")
+    parser.add_argument("--no_model_save", action="store_true", help="Do not save the model (default: False)")
+    parser.add_argument("--criterion", type=str, default="mse", choices=["mse", "ccc", "combined"], help="Loss function to use for training (default: mse)")
+    parser.add_argument("--VAD_weights", type=parse_vad_weights, default=[1.0, 1.0, 1.0], help="Weights for the VAD loss (default: [1.0, 1.0, 1.0])")
+    parser.add_argument("--orth_loss_weight", type=float, default=0.5, help="Weight for the orthogonal loss (default: 0.5)")
+    parser.add_argument("--ccc_weight", type=float, default=0.5, help="Weight for the CCC loss (default: 0.5)")
+    parser.add_argument("--lr_factor", type=float, default=0.1, help="Factor by which the learning rate will be reduced (default: 0.1)")
+    parser.add_argument("--lr_patience", type=int, default=10, help="Number of epochs with no improvement after which the learning rate will be reduced (default: 10)")
+    parser.add_argument("--lr_threshold", type=float, default=1e-4, help="Minimum change in the monitored quantity to qualify as an improvement (default: 1e-4)")
+    parser.add_argument("--lr_threshold_mode", type=str, default="rel", help="Mode to compare the monitored quantity to the threshold (default: rel)")
+    parser.add_argument("--lr_cooldown", type=int, default=0, help="Number of epochs to wait before resuming normal operation after a reduction in the learning rate (default: 0)")
+    parser.add_argument("--lr_min", type=float, default=0.0, help="Lower bound on the learning rate (default: 0.0)")
     return parser
 
 

@@ -21,81 +21,115 @@ Options:
 
 ```bash
   -h, --help            show this help message and exit
-  --seed SEED           Random seed for reproducibility
-  --dataset {fer,caers}
-                        Dataset name (default: fer)
+  --seed SEED           Random seed for reproducibility (default: 42)
+  --dataset {fer,caers,afew}
+                        Dataset to use for training and evaluation (default: fer)
+  --input_size INPUT_SIZE
+                        Image spatial resolution (default: 112)
+  --num_workers NUM_WORKERS
+                        DataLoader subprocess workers (default: 4)
   --early_stopping_patience EARLY_STOPPING_PATIENCE
-                        Number of epochs to wait for improvement before early stopping
+                        Number of epochs with no improvement after which training will be stopped (default: 20)
   --output_dir OUTPUT_DIR
-                        Directory to save checkpoints and logs
+                        Directory to save logs and model checkpoints (default: ./output)
   --batch_size BATCH_SIZE
                         Batch size for training (default: 32)
-  --epochs EPOCHS       Number of epochs to train (default: 100)
+  --epochs EPOCHS       Number of training epochs (default: 100)
   --learning_rate LEARNING_RATE
-                        Learning rate for the optimizer (default: 0.001)
+                        Learning rate for the optimizer (default: 1e-4)
   --weight_decay WEIGHT_DECAY
                         Weight decay for the optimizer (default: 5e-4)
   --model {vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,efficientnet,mobilenet,mobilefacenet}
                         Model architecture to use (default: vgg16)
-  --pretrained          Use pretrained weights for the model
-  --freezed             Freeze the convolutional layers of the model
+  --pretrained          Use pre-trained weights (default: False)
+  --freezed             Freeze the convolutional layers of the model (default: False)
   --dropout_rate DROPOUT_RATE
                         Dropout rate for the regression head (default: 0.5)
   --optimizer {adam,sgd,adamw}
-                        Optimizer to use (default: adam)
-  --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
+                        Optimizer to use for training (default: sgd)
+  --device {cuda,cpu}   Device to use for training (default: cuda)
   --grad_clip GRAD_CLIP
                         Gradient clipping value (default: 0.0, no clipping)
-  --data_augmentation   Enable data augmentation
-  --resume              Resume training from the last checkpoint if available
-  --no_checkpoint       Disable checkpoint saving
-  --no_model_save       Disable model saving
-  --weights_VAD WEIGHTS_VAD
-                        Weights for the V, A, and D losses (default: 1.0,1.0,1.0)
+  --data_augmentation   Apply data augmentation during training (default: False)
+  --resume              Resume training from a previous checkpoint (default: False)
+  --no_checkpoint       Do not save checkpoints (default: False)
+  --no_model_save       Do not save the model (default: False)
+  --criterion {mse,ccc,combined}
+                        Loss function to use for training (default: mse)
+  --VAD_weights VAD_WEIGHTS
+                        Weights for the VAD loss (default: [1.0, 1.0, 1.0])
   --orth_loss_weight ORTH_LOSS_WEIGHT
-                        Weight for the orthogonality loss (default: 0.5)
+                        Weight for the orthogonal loss (default: 0.5)
+  --ccc_weight CCC_WEIGHT
+                        Weight for the CCC loss (default: 0.5)
   --lr_factor LR_FACTOR
-                        Factor by which to reduce learning rate (default: 0.1)
+                        Factor by which the learning rate will be reduced (default: 0.1)
   --lr_patience LR_PATIENCE
-                        Number of epochs to wait for improvement before reducing learning rate (default: 10)
+                        Number of epochs with no improvement after which the learning rate will be reduced (default: 10)
   --lr_threshold LR_THRESHOLD
-                        Minimum change in loss to qualify as improvement (default: 1e-4)
+                        Minimum change in the monitored quantity to qualify as an improvement (default: 1e-4)
   --lr_threshold_mode LR_THRESHOLD_MODE
-                        Mode to use for determining if loss has improved (default: rel)
+                        Mode to compare the monitored quantity to the threshold (default: rel)
   --lr_cooldown LR_COOLDOWN
-                        Number of epochs to wait before resuming normal operation after reducing learning rate (default: 0)
-  --lr_min LR_MIN       Minimum learning rate (default: 0.0)
+                        Number of epochs to wait before resuming normal operation after a reduction in the learning rate (default: 0)
+  --lr_min LR_MIN       Lower bound on the learning rate (default: 0.0)
 ```
 
 3.Evaluate a model
 
 ```bash  
-python -m src.evaluation.evaluation
+python -m src.evaluation.test
 ```
 
 Options:
 
 ```bash  
   -h, --help            show this help message and exit
-  --model MODEL         Model architecture.
   --input-size INPUT_SIZE
-                        Image resolution.
-  --device DEVICE       Device.
-  --dataset DATASET     Dataset name.
+                        Image spatial resolution (default: 48).
+  --device {cuda,cpu}   Device to use for evaluation (default: cuda if available, otherwise cpu).
   --split {Test,Val,Train}
-                        Data split.
+                        Data split to evaluate on (default: Test).
   --state-dict-path STATE_DICT_PATH
-                        Path to state dict (.pth).
-  --batch-size BATCH_SIZE
-                        Batch size.
+                        Path to state dict with weights (.pth).
+```
+
+4.Plot the loss curve
+
+```bash
+python -m src.evaluation.plot_loss_curve
+```
+
+Options:
+
+```bash
+  -h, --help  show this help message and exit
+  --dir DIR   Directory containing log.csv files.
 ```
 
 ## Repository Layout
 
-- `data/`: untracked, store the dataset csvs generated with /src/data/prepare_datasets.py here
-- `models/`: model architectures for age estimation
+- `data/`: untracked, store the dataset csvs
+- `models/`: model architectures for emotion analysis
 - `output/`: training logs and model weights
 - `src/data/`: data preparation and preprocessing
+- `src/evaluation/`: evaluation scripts
 - `src/training/`: training scripts
 - `src/transforms/`: transforms methods for data loading and data augmentation
 - `src/utils/`: shared dataset and utility modules
+
+## Datasets
+
+### FER2013 re-labelled
+
+- Source: Huo, Y., & Ge, Y. (2025). *VAD-Net: Multidimensional Facial Expression Recognition in Intelligent Education System.*
+- Available at: [https://github.com/YeeHoran/VAD-Net/](https://github.com/YeeHoran/VAD-Net/)
+- Licence: MIT License
+
+### AFEW-VA
+
+- Sources:
+Kossaifi, J., Tzimiropoulos, G., Todorovic, S., & Pantic, M. (2017). AFEW-VA database for valence and arousal estimation in-the-wild, In *Image and Vision Computing*
+Dhall, A., Goecke, R., Lucey, S., & Gedeon, T. (2012). Collecting Large, Richly Annotated Facial-Expression Databases from Movies, In *IEEE MultiMedia*, (vol. 19, no. 3, pp. 34-41)
+- Available at: [https://ibug.doc.ic.ac.uk/resources/afew-va-database/](https://ibug.doc.ic.ac.uk/resources/afew-va-database/)
+- License: Available for research purpose only

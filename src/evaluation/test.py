@@ -7,7 +7,8 @@ import torch
 from pathlib import Path
 import optuna
 
-# Navigate UP 3 levels: training -> src -> Age_Estimation
+
+# Navigate UP 3 levels: evaluation -> src -> Project Root
 project_root = Path(__file__).resolve().parents[2]
 if project_root not in sys.path:
     sys.path.insert(0, str(project_root))
@@ -79,10 +80,10 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="VAD Evaluation (MSE & RMSE per dimension).")
-    parser.add_argument("--input-size", type=int, default=48, help="Image resolution.")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device.")
-    parser.add_argument("--split", type=str, default="Test", choices=["Test", "Val", "Train"], help="Data split.")
-    parser.add_argument("--state-dict-path", type=str, required=True, help="Path to state dict (.pth).")
+    parser.add_argument("--input-size", type=int, default=48, help="Image spatial resolution (default: 48).")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"], help="Device to use for evaluation (default: cuda if available, otherwise cpu).")
+    parser.add_argument("--split", type=str, default="Test", choices=["Test", "Val", "Train"], help="Data split to evaluate on (default: Test).")
+    parser.add_argument("--state-dict-path", type=str, required=True, help="Path to state dict with weights (.pth).")
 
     args = parser.parse_args()
     device = torch.device(args.device)

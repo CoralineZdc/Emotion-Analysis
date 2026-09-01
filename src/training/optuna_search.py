@@ -15,8 +15,8 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, log_csv_p
     opt = copy.deepcopy(base_opt)
 
     # 1. Hyperparameter Search Space
-    opt.model = trial.suggest_categorical("model", ["vgg11", "vgg13", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "efficientnet", "mobilenet", "mobilefacenet"])
-    opt.pretrained = trial.suggest_categorical("pretrained", [True, False])
+    #opt.model = trial.suggest_categorical("model", ["vgg11", "vgg13", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "efficientnet", "mobilenet", "mobilefacenet"])
+    opt.pretrained = True
     opt.freezed = trial.suggest_categorical("freezed", [True, False])
     opt.learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
     opt.weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
@@ -54,7 +54,8 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, log_csv_p
         best_val_loss, best_rmse_per_dim, target_names = run_training(opt, trial=trial)
         if best_rmse_per_dim is not None:
             for name, rmse in zip(target_names, best_rmse_per_dim):
-                trial.set_user_attr(f"val_rmse_{name}", rmse)
+                rmse_float = float(rmse.item()) if hasattr(rmse, "item") else float(rmse)
+                trial.set_user_attr(f"val_rmse_{name}", rmse_float)
     except optuna.exceptions.TrialPruned:
         status = "PRUNED"
         raise
