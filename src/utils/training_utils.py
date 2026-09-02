@@ -291,19 +291,6 @@ def compute_weighted_loss(
     return weighted_loss.sum(dim=1).mean()
 
 
-def compute_unnormlized_rmse(
-        preds: torch.Tensor, 
-        targets: torch.Tensor, 
-        label_mean: torch.Tensor, 
-        label_std: torch.Tensor
-    ) -> np.ndarray:
-    """Calculate the unnormalized RMSE for each dimension."""
-    preds_raw = preds * label_std + label_mean
-    targets_raw = targets * label_std + label_mean
-    rmse_per_dim = torch.sqrt(torch.mean((preds_raw - targets_raw) ** 2, dim=0)).cpu().numpy()
-    return rmse_per_dim
-
-
 def compute_batch_loss(
         outputs: torch.Tensor, 
         targets: torch.Tensor, 

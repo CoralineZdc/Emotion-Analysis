@@ -92,9 +92,8 @@ def preprocess_and_split_afew(
             frames_data = meta.get("frames", {})
 
             for frame_id, frame_info in frames_data.items():
-                # Scale from [-10, 10] to [-2, 2]
-                valence = float(frame_info["valence"]) / 5.0
-                arousal = float(frame_info["arousal"]) / 5.0
+                valence = float(frame_info["valence"])
+                arousal = float(frame_info["arousal"])
 
                 img_path = video_dir / f"{frame_id}.png"
                 if not img_path.exists():

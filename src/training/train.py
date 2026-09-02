@@ -31,6 +31,32 @@ def save_checkpoint(state: dict, filename: str) -> None:
     torch.save(state, filename)
 
 
+def get_parameter_groups(
+    model: torch.nn.Module, 
+    base_lr: float, 
+    backbone_lr_scale: float, 
+    weight_decay: float
+) -> list[dict]:
+    """Separate backbone parameters and regression head parameters to apply differential learning rates."""
+    head_keywords = ["fc", "classifier", "head", "linear", "output"]
+    
+    head_params = []
+    backbone_params = []
+
+    for name, param in model.named_parameters():
+        if any(keyword in name.lower() for keyword in head_keywords):
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    backbone_lr = base_lr * backbone_lr_scale
+
+    return [
+        {"params": head_params, "lr": base_lr, "weight_decay": weight_decay, "name": "head"},
+        {"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay, "name": "backbone"}
+    ]
+
+
 def train(
     epoch: int,
     dataloader: torch.utils.data.DataLoader,
@@ -39,8 +65,6 @@ def train(
     weights: torch.Tensor,
     device: torch.device,
     opt: argparse.Namespace,
-    label_mean: torch.Tensor,
-    label_std: torch.Tensor,
     trial: optuna.trial.Trial | None = None,
 ) -> tuple[float, np.ndarray]:
     """Run one training epoch and return the average loss and RMSE."""
@@ -52,7 +76,9 @@ def train(
     # Suppress verbose batch progress printing during Optuna sweeps
     is_optuna = trial is not None
     if not is_optuna:
-        print(f"\nEpoch: {epoch} | LR: {optimizer.param_groups[0]['lr']:.6f}")
+        head_lr = optimizer.param_groups[0]["lr"]
+        backbone_lr = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else head_lr
+        print(f"\nEpoch: {epoch} | Head LR: {head_lr:.6f} | Backbone LR: {backbone_lr:.6f}")
 
     for batch_idx, (inputs, targets) in enumerate(dataloader):
         inputs, targets = inputs.to(device), targets.to(device)
@@ -77,9 +103,9 @@ def train(
 
         optimizer.step()
 
-        total_loss += loss.item()
-        all_preds.append(outputs.detach())
-        all_targets.append(targets.detach())
+        total_loss += batch_loss.item() # Only register main loss for logging
+        all_preds.append(outputs.detach().cpu()) 
+        all_targets.append(targets.detach().cpu())
 
         if not is_optuna:
             progress = (batch_idx + 1) / num_batches
@@ -93,10 +119,9 @@ def train(
 
     preds_cat = torch.cat(all_preds, dim=0)
     targets_cat = torch.cat(all_targets, dim=0)
-    rmse_per_dim = compute_unnormlized_rmse(preds_cat, targets_cat, label_mean, label_std)
+    rmse_per_dim = torch.sqrt(torch.mean((preds_cat - targets_cat) ** 2, dim=0)).cpu().numpy()
 
     return avg_loss, rmse_per_dim
-
 
 
 def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = None) -> tuple[float, np.ndarray, list[str]]:
@@ -104,7 +129,6 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     device = torch.device("cuda" if torch.cuda.is_available() and opt.device == "cuda" else "cpu")
     is_optuna = trial is not None
 
-    # Fix: Dataset-specific target enforcement
     if opt.dataset.lower() == "afew":
         opt.VAD_weights = [opt.VAD_weights[0], opt.VAD_weights[1], 0.0]
 
@@ -126,19 +150,19 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
         print(f"Starting training {opt.model} on {opt.dataset} dataset ({num_outputs} outputs)")
         print(f"Using device: {device} | Batch Size: {opt.batch_size} | Epochs: {opt.epochs}")
 
-    # Output directory handling
-    aug_str = "_data-aug" if opt.data_augmentation else ""
-    ccc_str = f"_CCCweight{opt.ccc_weight:.2f}" if opt.criterion == "combined" else ""
-    folder_name = (
-        f"{opt.model}/seed{opt.seed}_dataset-{opt.dataset}{aug_str}_criterion-{opt.criterion}{ccc_str}"
-        f"_V{opt.VAD_weights[0]:.1f}_A{opt.VAD_weights[1]:.1f}_D{opt.VAD_weights[2]:.1f}"
-        f"_opt-{opt.optimizer}_lr{opt.learning_rate:.5f}_bs{opt.batch_size}_dropout{opt.dropout_rate:.1f}"
-    )
-    path = os.path.join(opt.output_dir, folder_name)
-    os.makedirs(path, exist_ok=True)
+        aug_str = "_dataaug" if opt.data_augmentation else ""
+        ccc_str = f"_CCCweight{opt.ccc_weight:.2f}" if opt.criterion == "combined" else ""
+        folder_name = (
+            f"{opt.model}/seed{opt.seed}_dataset-{opt.dataset}{aug_str}_criterion-{opt.criterion}{ccc_str}"
+            f"_V{opt.VAD_weights[0]:.1f}_A{opt.VAD_weights[1]:.1f}_D{opt.VAD_weights[2]:.1f}"
+            f"_opt-{opt.optimizer}_lr{opt.learning_rate:.5f}_backboneLRscale{opt.backbone_lr_scale:.2f}"
+            f"_bs{opt.batch_size}_dropout{opt.dropout_rate:.1f}"
+        )
+        path = os.path.join(opt.output_dir, folder_name)
+        os.makedirs(path, exist_ok=True)
+        print(f"Logs and checkpoints will be saved to: {path}")
 
     # Model Initialization
-    # Use num_channels=1 for pretrained models (trained on grayscale), num_channels=3 for training from scratch
     num_channels = 1 if opt.pretrained else 3
     model = load_model(opt.model, num_channels=num_channels, num_outputs=num_outputs, dropout_rate=opt.dropout_rate, freezed=opt.freezed, display=not is_optuna)
     pretrain_dataset_name = None
@@ -148,17 +172,12 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     model.to(device)
 
     # Target label statistics and image statistics
-    # DataLoader.size must be the size of pixels in the CSV (48x48), not the model input size
-    DataLoader.size = 48 if opt.dataset == "fer" else 112
     DataLoader.set_data_protocol("small_split")
-    # Set number of channels based on pretrained status: 1 for pretrained (grayscale), 3 for training from scratch
     DataLoader.set_num_channels(num_channels)
     DataLoader._ensure_image_stats(opt.dataset)
     DataLoader._ensure_label_stats(opt.dataset)
 
-    # Ensure mean and std remain on CPU for DataLoader subprocess workers
     if pretrain_dataset_name == "ms1m":
-        # Use single-channel normalization for pretrained grayscale models
         if num_channels == 1:
             image_mean = [0.5]
             image_std = [0.5]
@@ -172,7 +191,6 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
             image_mean = image_mean.tolist()
         if isinstance(image_std, (torch.Tensor, np.ndarray)):
             image_std = image_std.tolist()
-        # Adjust to num_channels if using grayscale
         if num_channels == 1 and len(image_mean) > 1:
             image_mean = [image_mean[0]]
             image_std = [image_std[0]]
@@ -198,23 +216,27 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
         transforms.Normalize(mean=image_mean, std=image_std),
     ])
 
-    # DataLoaders with configurable parallel workers
+    # DataLoaders
     train_dataset = DataLoader(opt.dataset, split="Train", include_V=include_V, include_A=include_A, include_D=include_D, transform=train_transform, display=not is_optuna)
     trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True)
 
     val_dataset = DataLoader(opt.dataset, split="Val", include_V=include_V, include_A=include_A, include_D=include_D, transform=val_transform, display=not is_optuna)
     valloader = torch.utils.data.DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False, num_workers=opt.num_workers, pin_memory=True)
 
-    label_mean = train_dataset.active_label_mean.to(device, dtype=torch.float32)
-    label_std = train_dataset.active_label_std.to(device, dtype=torch.float32)
+    # Optimizer with Parameter Groups for Differential Learning Rates
+    param_groups = get_parameter_groups(
+        model, 
+        base_lr=opt.learning_rate, 
+        backbone_lr_scale=opt.backbone_lr_scale, 
+        weight_decay=opt.weight_decay
+    )
 
-    # Optimizer & Scheduler
     if opt.optimizer == "adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=opt.learning_rate, weight_decay=opt.weight_decay)
+        optimizer = torch.optim.Adam(param_groups)
     elif opt.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=opt.learning_rate, weight_decay=opt.weight_decay)
+        optimizer = torch.optim.AdamW(param_groups)
     elif opt.optimizer == "sgd":
-        optimizer = torch.optim.SGD(model.parameters(), lr=opt.learning_rate, momentum=0.9, weight_decay=opt.weight_decay)
+        optimizer = torch.optim.SGD(param_groups, momentum=0.9)
     else:
         raise ValueError(f"Unsupported optimizer: {opt.optimizer}")
 
@@ -230,9 +252,9 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     )
 
     # Logging
-    log_file = os.path.join(path, "log.csv")
     if not is_optuna:
-        with open(log_file, "w") as f:
+        log_file = os.path.join(path, "log.csv")
+        with open(log_file, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["epoch", "train_loss"] + [f"{n}_train_rmse" for n in target_names] + ["val_loss"] + [f"{n}_val_rmse" for n in target_names])
 
@@ -241,18 +263,29 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     early_stop_counter = 0
 
     for epoch in range(opt.epochs):
-        train_loss, train_rmse = train(epoch, trainloader, model, optimizer, weights_tensor, device, opt, label_mean, label_std, trial)
-        val_loss, val_rmse = evaluate(valloader, model, opt.criterion, alpha=opt.ccc_weight, weights=weights_tensor, label_mean=label_mean, label_std=label_std, device=device, trial=trial)
+        # Mid-training unfreezing check
+        if opt.freezed and opt.unfreeze_epoch >= 0 and epoch == opt.unfreeze_epoch:
+            if not is_optuna:
+                print(f"\n>>> Epoch {epoch}: Unfreezing backbone layers for fine-tuning <<<")
+            for name, param in model.named_parameters():
+                param.requires_grad = True
+
+        train_loss, train_rmse = train(epoch, trainloader, model, optimizer, weights_tensor, device, opt, trial)
+        val_loss, val_rmse = evaluate(valloader, model, opt.criterion, alpha=opt.ccc_weight, weights=weights_tensor, device=device, trial=trial)
         val_loss_float = float(val_loss.item()) if hasattr(val_loss, "item") else float(val_loss)
 
         if not is_optuna:
             print(f"Train Loss: {train_loss:.4f} | {' | '.join(f'Train RMSE {name}: {rmse:.4f}' for name, rmse in zip(target_names, train_rmse))}")
             print(f"Val Loss: {val_loss:.4f} | {' | '.join(f'Val RMSE {name}: {rmse:.4f}' for name, rmse in zip(target_names, val_rmse))}")
 
+            with open(log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([epoch, train_loss] + train_rmse.tolist() + [val_loss_float] + val_rmse.tolist())
+
         scheduler.step(val_loss_float)
 
-        if val_loss < best_score:
-            best_score = val_loss
+        if val_loss_float < best_score:
+            best_score = val_loss_float
             best_val_rmse = val_rmse
             early_stop_counter = 0
             if not opt.no_model_save and not is_optuna:
@@ -275,14 +308,16 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
-    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew"], help ="Dataset to use for training and evaluation (default: fer)")
+    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew"], help="Dataset to use for training and evaluation (default: fer)")
     parser.add_argument("--input_size", type=int, default=112, help="Image spatial resolution (default: 112)")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader subprocess workers (default: 4)")
     parser.add_argument("--early_stopping_patience", type=int, default=20, help="Number of epochs with no improvement after which training will be stopped (default: 20)")
     parser.add_argument("--output_dir", type=str, default="./output", help="Directory to save logs and model checkpoints (default: ./output)")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training (default: 32)")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs (default: 100)")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer (default: 1e-4)")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer head (default: 1e-4)")
+    parser.add_argument("--backbone_lr_scale", type=float, default=0.1, help="Scale factor for backbone learning rate relative to head LR (default: 0.1)")
+    parser.add_argument("--unfreeze_epoch", type=int, default=-1, help="Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)")
     parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay for the optimizer (default: 5e-4)")
     parser.add_argument("--model", type=str, default="vgg16", choices=["vgg11", "vgg13", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "efficientnet", "mobilenet", "mobilefacenet"], help="Model architecture to use (default: vgg16)")
     parser.add_argument("--pretrained", action="store_true", help="Use pre-trained weights (default: False)")

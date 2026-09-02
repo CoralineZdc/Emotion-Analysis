@@ -25,8 +25,9 @@ class DataLoader(data.Dataset):
         transform: Transform pipeline applied at sample fetch time.
     """
 
-    label_mean: Optional[torch.Tensor] = None
-    label_std: Optional[torch.Tensor] = None
+    label_mid: Optional[int] = None
+    label_half_range: Optional[float] = None
+
     image_mean: Optional[torch.Tensor] = None
     image_std: Optional[torch.Tensor] = None
 
@@ -93,7 +94,7 @@ class DataLoader(data.Dataset):
     @classmethod
     def _ensure_label_stats(cls, dataset: str) -> None:
         # Recompute stats if dataset changes or if stats are not loaded
-        if cls.loaded_dataset == dataset and cls.label_mean is not None:
+        if cls.loaded_dataset == dataset and cls.label_mid is not None:
             return
 
         train_path = cls._resolve_data_file(cls._get_split_candidates("Train", dataset))
@@ -108,12 +109,19 @@ class DataLoader(data.Dataset):
 
         label_array = train_df[cls.available_columns].to_numpy(dtype=np.float32)
 
-        mean = label_array.mean(axis=0)
-        std = label_array.std(axis=0)
-        std[std == 0] = 1.0  # Avoid division by zero
+        # Mask out invalid entries (NaN or out-of-range values)
+        valid_mask = np.all(np.isfinite(label_array), axis=1)
+        valid_labels = label_array[valid_mask]
 
-        cls.label_mean = torch.tensor(mean, dtype=torch.float32)
-        cls.label_std = torch.tensor(std, dtype=torch.float32)
+        min_vals = valid_labels.min(axis=0)
+        max_vals = valid_labels.max(axis=0)
+        mid_vals = (min_vals + max_vals) / 2.0
+        half_ranges = (max_vals - min_vals) / 2.0
+
+        half_ranges[half_ranges == 0] = 1.0  # Avoid division by zero
+
+        cls.label_mid = torch.tensor(mid_vals, dtype=torch.float32)
+        cls.label_half_range = torch.tensor(half_ranges, dtype=torch.float32)
 
     @classmethod
     def _ensure_image_stats(cls, dataset: str) -> None:
@@ -124,14 +132,15 @@ class DataLoader(data.Dataset):
         train_df = pd.read_csv(train_path)
         pixels = []
 
-        expected_length = cls.size * cls.size
+        pixels_length = len(train_df["pixels"][0].split())
+        cls.size = int(np.sqrt(pixels_length))
         for pixel_entry in train_df["pixels"]:
             pixel_str = str(pixel_entry).strip()
             if not pixel_str or pixel_str.lower() == "nan":
                 continue
             try:
                 values = np.fromstring(pixel_str, dtype=np.float32, sep=" ")
-                if len(values) == expected_length:
+                if len(values) == pixels_length:
                     pixels.append(values / 255.0)
             except ValueError:
                 continue
@@ -173,10 +182,6 @@ class DataLoader(data.Dataset):
         DataLoader._ensure_label_stats(dataset)
         DataLoader._ensure_image_stats(dataset)
 
-        # Handle missing columns (e.g. Dominance in AFEW)
-        if "Dominance" not in DataLoader.available_columns:
-            include_D = False
-
         self.include_V = include_V and ("Valence" in DataLoader.available_columns)
         self.include_A = include_A and ("Arousal" in DataLoader.available_columns)
         self.include_D = include_D and ("Dominance" in DataLoader.available_columns)
@@ -201,8 +206,8 @@ class DataLoader(data.Dataset):
                 f"Available in CSV: {DataLoader.available_columns}"
             )
 
-        self.active_label_mean = DataLoader.label_mean[active_indices]
-        self.active_label_std = DataLoader.label_std[active_indices]
+        self.active_label_mid = DataLoader.label_mid[active_indices]
+        self.active_label_half_range = DataLoader.label_half_range[active_indices]
 
         split_candidates = self._get_split_candidates(self.split, self.dataset)
         split_file = self._resolve_data_file(split_candidates)
@@ -210,18 +215,9 @@ class DataLoader(data.Dataset):
 
         processed_images = []
         processed_labels = []
-        dropped_outliers = 0
-        empty_pixels_count = 0
-        invalid_format_count = 0
-        invalid_len_count = 0
+        dropped_invalid = 0
         total_rows = len(data_df)
         expected_length = self.size * self.size
-
-        # Define valid label ranges based on dataset
-        if "afew" in dataset.lower():
-            min_valid, max_valid = -2.0, 2.0
-        else:
-            min_valid, max_valid = -2.0, 2.0
 
         for idx, row in data_df.iterrows():
             progress = (idx + 1) / total_rows
@@ -236,48 +232,36 @@ class DataLoader(data.Dataset):
             try:
                 pixels = np.fromstring(pixel_str, dtype=np.uint8, sep=" ")
             except ValueError:
-                invalid_format_count += 1
+                dropped_invalid += 1
                 continue
 
             if len(pixels) != expected_length:
-                invalid_len_count += 1
+                dropped_invalid += 1
                 continue
 
             label_values = row[active_columns].to_numpy(dtype=np.float32)
 
             # Filter out outlier samples based on dataset limits
-            if (label_values < min_valid).any() or (label_values > max_valid).any():
-                dropped_outliers += 1
+            if not np.isfinite(label_values).all():
+                dropped_invalid += 1
                 continue
 
             arr_2d = pixels.reshape(self.size, self.size)
-            # Create 1-channel (grayscale) or 3-channel (RGB) images based on num_channels
-            # PIL needs (H, W) for grayscale or (H, W, 3) for RGB - not (H, W, 1)
-            if self.num_channels == 1:
-                arr_channel = arr_2d  # Keep as (48, 48) for grayscale
-            else:
-                arr_channel = np.stack([arr_2d, arr_2d, arr_2d], axis=2)  # (48, 48) -> (48, 48, 3)
+            arr_channel = arr_2d if self.num_channels == 1 else np.stack([arr_2d] * 3, axis=-1)
             processed_images.append(arr_channel)
             processed_labels.append(label_values)
 
         print(" " * 100, end="\r") if self.display else None
-        if dropped_outliers > 0 and self.display:
+        if dropped_invalid > 0 and self.display:
             print(
-                f"[Label Warning] '{self.split}' split: Dropped {dropped_outliers} outlier samples "
-                f"outside [{min_valid}, {max_valid}]."
+                f"[Label Warning] '{self.split}' split: Dropped {dropped_invalid} invalid samples."
             )
 
         self.images = processed_images
         raw_labels = torch.tensor(np.array(processed_labels), dtype=torch.float32)
-        self.labels = (raw_labels - self.active_label_mean) / self.active_label_std
-
+        self.labels = (raw_labels - self.active_label_mid) / self.active_label_half_range
         raw_labels_np = np.array(processed_labels)
-        if self.display:
-            print(f"[{self.split}] Raw Mean ({', '.join(active_columns)}): {raw_labels_np.mean(axis=0)}")
-            print(f"[{self.split}] Raw Std  ({', '.join(active_columns)}): {raw_labels_np.std(axis=0)}")
-            print(f"[{self.split}] Normalized Mean ({', '.join(active_columns)}): {self.labels.mean(dim=0).numpy()}")
-            print(f"[{self.split}] Normalized Std  ({', '.join(active_columns)}): {self.labels.std(dim=0).numpy()}")
-            print(f"Finished processing {self.split} data. Total valid samples: {len(self.images)}")
+        print(f"Finished processing {self.split} data. Total valid samples: {len(self.images)}") if self.display else None
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         img = Image.fromarray(self.images[index])

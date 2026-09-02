@@ -15,7 +15,7 @@ if project_root not in sys.path:
 
 from src.utils.data_loader import DataLoader
 from src.utils.transforms import Compose, Resize, ToTensor, Normalize
-from src.utils.training_utils import compute_unnormlized_rmse, load_model, compute_batch_loss
+from src.utils.training_utils import load_model, compute_batch_loss
 
 
 def repo_root() -> str:
@@ -40,8 +40,6 @@ def evaluate(
         criterion_type: str = "mse",
         alpha: float = 0.5,
         weights: torch.Tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32),
-        label_mean: torch.Tensor = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
-        label_std: torch.Tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32),
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), 
         trial: optuna.trial.Trial | None = None
     ):
@@ -49,12 +47,13 @@ def evaluate(
     total_loss = 0.0
     all_preds, all_targets = [], []
     total_batches = len(dataloader)
+    is_optuna = trial is not None
 
     with torch.no_grad():
         for i, (inputs, targets) in enumerate(dataloader, 1):
             progress = (i / total_batches) 
             bar = "█" * int(progress * 20) + " " * int(20 - int(progress * 20))
-            print(f"Evaluation: |{bar}| {progress * 100 :.2f}% [{i}/{total_batches}]", end="\r")
+            print(f"Evaluation: |{bar}| {progress * 100 :.2f}% [{i}/{total_batches}]", end="\r") if not is_optuna else None
 
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
@@ -64,16 +63,16 @@ def evaluate(
             batch_loss = compute_batch_loss(outputs, targets, weights, criterion_type, alpha)
             total_loss += batch_loss.item()
             
-            all_preds.append(outputs)
-            all_targets.append(targets)
+            all_preds.append(outputs.detach().cpu())
+            all_targets.append(targets.detach().cpu())
 
-    print(" " * 80, end="\r")
+    print(" " * 80, end="\r") if not is_optuna else None  # Clear the progress bar line
 
-    avg_loss = total_loss / total_batches
+    avg_loss = total_loss / max(total_batches, 1)
 
     preds_cat = torch.cat(all_preds, dim=0)
     targets_cat = torch.cat(all_targets, dim=0)
-    rmse_per_dim = compute_unnormlized_rmse(preds_cat, targets_cat, label_mean, label_std)
+    rmse_per_dim = torch.sqrt(torch.mean((preds_cat - targets_cat) ** 2, dim=0)).cpu().numpy()
 
     return avg_loss, rmse_per_dim
 
@@ -145,12 +144,8 @@ def main():
     dataset = DataLoader(split=args.split, dataset=dataset_name, transform=test_transform, include_V=include_flags[0], include_A=include_flags[1], include_D=include_flags[2])
     test_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # Extracting label mean and std for unnormalization
-    label_mean = dataset.active_label_mean.detach().clone().to(dtype=torch.float32, device=device)
-    label_std = dataset.active_label_std.detach().clone().to(dtype=torch.float32, device=device)
-
     # Run evaluation
-    avg_loss, rmse_per_dim = evaluate(test_loader, model, weights=weights, label_mean=label_mean, label_std=label_std, device=device)
+    avg_loss, rmse_per_dim = evaluate(test_loader, model, weights=weights, device=device)
 
     # Display results
     print(f"\n=== Evaluation Results on '{args.split}' ===")
