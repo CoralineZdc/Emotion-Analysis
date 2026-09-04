@@ -308,7 +308,7 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
-    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew"], help="Dataset to use for training and evaluation (default: fer)")
+    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew", "emotic"], help="Dataset to use for training and evaluation (default: fer)")
     parser.add_argument("--input_size", type=int, default=112, help="Image spatial resolution (default: 112)")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader subprocess workers (default: 4)")
     parser.add_argument("--early_stopping_patience", type=int, default=20, help="Number of epochs with no improvement after which training will be stopped (default: 20)")

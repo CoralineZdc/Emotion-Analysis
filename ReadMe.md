@@ -11,7 +11,33 @@ The dataset used for training is FER2013.
 python -m pip install -r requirements.txt
 ```
 
-2.Train a single model:
+2.Preprocess datasets
+
+Preprocessing pipeline for AFEW and Emotic datasets. Refercences, download links and licences are given in the [Datasets](#datasets) section.
+Datasets will be saved in /data/{split}_{dataset}.csv .
+
+```bash
+python -m src.data.preprocess
+```
+
+Options:
+
+```bash
+  -h, --help            show this help message and exit
+  --dataset {afew,emotic,all}
+                        Dataset to preprocess
+  --data_dir DATA_DIR   Root path to input dataset directory
+  --output_dir OUTPUT_DIR
+                        Path to output processed CSVs
+  --image_size IMAGE_SIZE
+                        Output image size (width & height)
+  --include_extra       Include EMOTIC extra training data
+```
+
+3.Train a single model
+
+Pipeline for training models from /models on datasets in /data.
+When saved, the weights which gave the best performances can be found in /output/{model}/seed{seed}_dataset-{dataset}_{dataaug if data augmentation enabled}_criterion-{criterion}_{CCCweight{CCC weight} if criterion = "combined"}_V{V weight}_A{A weight}_D{D weight}_opt-{optimizer}_lr{learning}_backboneLRscale{backbone learning rate scale}_bs{batch size}_dropout{dropout rate}/best_model_state.pth .
 
 ```bash
 python -m src.training.train
@@ -75,7 +101,9 @@ Options:
   --lr_min LR_MIN       Lower bound on the learning rate (default: 0.0)
 ```
 
-3.Evaluate a model
+4.Evaluate a model
+
+Script to evaluate models trained with the pipeline above on the test dataset.
 
 ```bash  
 python -m src.evaluation.test
@@ -94,7 +122,9 @@ Options:
                         Path to state dict with weights (.pth).
 ```
 
-4.Plot the loss curve
+5.Plot a loss curve
+
+Plots the curves corresponding to all log.csv file located in the specified directory.
 
 ```bash
 python -m src.evaluation.plot_loss_curve
