@@ -153,7 +153,7 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
         aug_str = "_dataaug" if opt.data_augmentation else ""
         ccc_str = f"_CCCweight{opt.ccc_weight:.2f}" if opt.criterion == "combined" else ""
         folder_name = (
-            f"{opt.model}/seed{opt.seed}_dataset-{opt.dataset}{aug_str}_criterion-{opt.criterion}{ccc_str}"
+            f"{opt.model}/seed{opt.seed}_dataset-{opt.dataset}{aug_str}_modelweights-{opt.weights_source}_criterion-{opt.criterion}{ccc_str}"
             f"_V{opt.VAD_weights[0]:.1f}_A{opt.VAD_weights[1]:.1f}_D{opt.VAD_weights[2]:.1f}"
             f"_opt-{opt.optimizer}_lr{opt.learning_rate:.5f}_backboneLRscale{opt.backbone_lr_scale:.2f}"
             f"_bs{opt.batch_size}_dropout{opt.dropout_rate:.1f}"
@@ -163,11 +163,16 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
         print(f"Logs and checkpoints will be saved to: {path}")
 
     # Model Initialization
-    num_channels = 1 if opt.pretrained else 3
+    num_channels = 1 if opt.pretrained and opt.weights_source == "custom" else 3
     model = load_model(opt.model, num_channels=num_channels, num_outputs=num_outputs, dropout_rate=opt.dropout_rate, freezed=opt.freezed, display=not is_optuna)
     pretrain_dataset_name = None
     if opt.pretrained:
-        model, pretrain_dataset_name = load_pretrained_weights(model, opt.model, display=not is_optuna)
+        model, pretrain_dataset_name = load_pretrained_weights(
+            model=model, 
+            model_name=opt.model, 
+            weights_source=opt.weights_source,
+            display=not is_optuna
+        )
 
     model.to(device)
 
@@ -178,12 +183,11 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     DataLoader._ensure_label_stats(opt.dataset)
 
     if pretrain_dataset_name == "ms1m":
-        if num_channels == 1:
-            image_mean = [0.5]
-            image_std = [0.5]
-        else:
-            image_mean = [0.5, 0.5, 0.5]
-            image_std = [0.5, 0.5, 0.5]
+        image_mean = [0.5]if num_channels == 1 else [0.5, 0.5, 0.5]
+        image_std = [0.5] if num_channels == 1 else [0.5, 0.5, 0.5]
+    elif pretrain_dataset_name == "imagenet":
+        image_mean = [0.485, 0.456, 0.406]
+        image_std = [0.229, 0.224, 0.225]
     else:
         image_mean = DataLoader.image_mean
         image_std = DataLoader.image_std
@@ -308,7 +312,7 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
-    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew", "emotic"], help="Dataset to use for training and evaluation (default: fer)")
+    parser.add_argument("--dataset", type=str, default="fer", choices=["fer", "caers", "afew", "emotic", "heco"], help="Dataset to use for training and evaluation (default: fer)")
     parser.add_argument("--input_size", type=int, default=112, help="Image spatial resolution (default: 112)")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader subprocess workers (default: 4)")
     parser.add_argument("--early_stopping_patience", type=int, default=20, help="Number of epochs with no improvement after which training will be stopped (default: 20)")
@@ -321,6 +325,7 @@ def build_parser():
     parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay for the optimizer (default: 5e-4)")
     parser.add_argument("--model", type=str, default="vgg16", choices=["vgg11", "vgg13", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "efficientnet", "mobilenet", "mobilefacenet"], help="Model architecture to use (default: vgg16)")
     parser.add_argument("--pretrained", action="store_true", help="Use pre-trained weights (default: False)")
+    parser.add_argument("--weights_source", type=str, default="imagenet", choices=["imagenet", "custom"], help="Source of pre-trained weights (default: imagenet)")
     parser.add_argument("--freezed", action="store_true", help="Freeze the convolutional layers of the model (default: False)")
     parser.add_argument("--dropout_rate", type=float, default=0.5, help="Dropout rate for the regression head (default: 0.5)")
     parser.add_argument("--optimizer", type=str, default="sgd", choices=["adam", "sgd", "adamw"], help="Optimizer to use for training (default: sgd)")

@@ -8,6 +8,7 @@ import re
 from torch.nn import functional as F
 import numpy as np
 from typing import Optional, Tuple
+import torchvision.models as tv_models
 
 from models import resnet, vgg, mobilenet, mobilefacenet, efficientnet
 
@@ -112,54 +113,103 @@ def _match_model_state_dict(model: torch.nn.Module, pretrained_weights: dict) ->
 
 
 
-def load_pretrained_weights(model: torch.nn.Module, model_name: str, display: bool = True) -> Tuple[torch.nn.Module, Optional[str]]:
+def load_pretrained_weights(
+        model: torch.nn.Module, 
+        model_name: str, 
+        weights_source: str = "imagenet",
+        display: bool = True
+    ) -> Tuple[torch.nn.Module, Optional[str]]:
     """Load pretrained weights into the model, ignoring mismatched layers."""
-    weights_folder = os.path.join(project_root, "models", "weights")
-    if not os.path.exists(weights_folder):
-        print(f"Warning: Weights folder '{weights_folder}' does not exist. Skipping weight loading.") if display else None
-        return model, "unknown"
+    raw_state_dict = None
+    dataset_name = "unknown"
+    source_label = ""
 
-    weights_list = os.listdir(weights_folder)
-    weight_file = next((file for file in weights_list if model_name.lower() in file.lower()), None)
+    if weights_source == "imagenet":
+        tv_name_map = {
+            "resnet18": "resnet18",
+            "resnet34": "resnet34",
+            "resnet50": "resnet50",
+            "vgg11": "vgg11",
+            "vgg13": "vgg13",
+            "vgg16": "vgg16",
+            "vgg19": "vgg19",
+            "efficientnet": "efficientnet_b0",
+            "mobilenet": "mobilenet_v2",
+        }
+        tv_arch = tv_name_map.get(model_name.lower(), model_name.lower())
+        try:
+            tv_model = tv_models.get_model(tv_arch, weights="DEFAULT")
+            raw_state_dict = tv_model.state_dict()
+            dataset_name = "imagenet"
+            source_label = f"torchvision ImageNet weights"
+        except Exception as e:
+            print(f"Error loading torchvision weights for {model_name}: {e}") if display else None
+            return model, "unknown"
 
-    if weight_file is None:
-        print(f"No pretrained weights found for model: {model_name}") if display else None
-        return model, "unknown"  # Return the model without loading weights
+    elif weights_source == "custom":
+        weights_folder = os.path.join(project_root, "models", "weights")
+        if not os.path.exists(weights_folder):
+            print(f"Warning: Weights folder '{weights_folder}' does not exist. Skipping weight loading.") if display else None
+            return model, "unknown"
 
-    file_path = os.path.join(weights_folder, weight_file)
-    file_name = os.path.basename(weight_file)
-    root, extension = os.path.splitext(file_name)
+        weights_list = os.listdir(weights_folder)
+        weight_file = next((file for file in weights_list if model_name.lower() in file.lower()), None)
 
-    parts = root.split("_")
-    dataset_name = parts[1] if len(parts) > 1 else None  # Assuming the format is model_dataset.pth or model_dataset.pt
+        if weight_file is None:
+            print(f"No pretrained weights found for model: {model_name}") if display else None
+            return model, "unknown"  # Return the model without loading weights
 
-    if extension in [".pth", ".pt"]:
-        pretrained_weights = torch.load(file_path, map_location=torch.device('cpu'))
-    elif extension == ".onnx":
-        onnx_model = onnx.load(file_path)
-        pytorch_model = onnx2pytorch.ConvertModel(onnx_model)
-        pretrained_weights = pytorch_model.state_dict()
+        file_path = os.path.join(weights_folder, weight_file)
+        source_label = f"custom weights from {file_path}"
+        file_name = os.path.basename(weight_file)
+        root, extension = os.path.splitext(file_name)
+
+        parts = root.split("_")
+        dataset_name = parts[1] if len(parts) > 1 else None  # Assuming the format is model_dataset.pth or model_dataset.pt
+
+        if extension in [".pth", ".pt"]:
+            raw_state_dict = torch.load(file_path, map_location=torch.device('cpu'))
+        elif extension == ".onnx":
+            onnx_model = onnx.load(file_path)
+            pytorch_model = onnx2pytorch.ConvertModel(onnx_model)
+            raw_state_dict = pytorch_model.state_dict()
+        else:
+            raise ValueError(f"Unsupported weight file format: {extension}")
+
     else:
-        raise ValueError(f"Unsupported weight file format: {extension}")
+        raise ValueError(f"Unsupported weights source: {weights_source}. Choose 'imagenet' or 'custom'.")
 
-    if isinstance(pretrained_weights, dict) and 'state_dict' in pretrained_weights:
-        pretrained_weights = pretrained_weights['state_dict']
-
-    model_dict = model.state_dict()
-    pretrained_dict = _match_model_state_dict(model, pretrained_weights)
-
-    if not pretrained_dict:
-        print(
-            f"Warning: no compatible weight keys matched for model '{model_name}' in '{file_path}'. "
-            "This usually means the checkpoint was trained with a different architecture, a different module naming scheme, "
-            "or an ONNX export that uses generic initializer names such as '_initializer_123'."
-        ) if display else None
+    if raw_state_dict is None or not isinstance(raw_state_dict, dict):
+        print(f"Warning: No valid state_dict found in {source_label}. Skipping weight loading.") if display else None
         return model, dataset_name
 
-    model_dict.update(pretrained_dict)
+    for key in ["state_dict", "model"]:
+        if key in raw_state_dict and isinstance(raw_state_dict[key], dict):
+            raw_state_dict = raw_state_dict[key]
+            break
+
+    model_dict = model.state_dict()
+    matched_dict = {}
+
+    for key, weight_tensor in raw_state_dict.items():
+        clean_key = key[len("module."):] if key.startswith("module.") else key
+
+        candidate_keys = [f"backbone.{clean_key}", clean_key]
+        if clean_key.startswith("backbone."):
+            candidate_keys.append(clean_key[len("backbone."):])
+
+        matched_key = next((k for k in candidate_keys if k in model_dict and model_dict[k].shape == weight_tensor.shape), None)
+        if matched_key:
+            matched_dict[matched_key] = weight_tensor
+
+    if not matched_dict:
+        print(f"Warning: No compatible weight keys matched for model '{model_name}' in '{source_label}'. ") if display else None
+        return model, dataset_name
+
+    model_dict.update(matched_dict)
     model.load_state_dict(model_dict, strict=False)
 
-    print(f"Successfully loaded {len(pretrained_dict)}/{len(model_dict)} layers from {file_path} for model: {model_name}") if display else None
+    print(f"Successfully loaded {len(matched_dict)}/{len(model_dict)} layers from {source_label} for model: {model_name}") if display else None
     return model, dataset_name
 
 
@@ -342,14 +392,3 @@ class CCCLoss(torch.nn.Module):
 
         ccc = (2.0 * covariance) / (var_preds + var_targets + (mean_preds - mean_targets) ** 2 + 1e-8)
         return 1.0 - ccc  # Return 1 - CCC as the loss to minimize
-
-
-
-
-
-
-
-
-
-
-

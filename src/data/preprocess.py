@@ -24,6 +24,7 @@ class VADSample:
     dominance: Optional[float]
     pixels: str
     group_id: Optional[str] = None  # Used for group-based splitting (e.g., video ID)
+    age: Optional[str] = None
 
 
 class PreprocessDataset(ABC):
@@ -36,17 +37,66 @@ class PreprocessDataset(ABC):
         output_dir: Union[str, Path],
         target_size: Tuple[int, int] = (112, 112),
         split_ratios: Tuple[float, float, float] = (0.6, 0.2, 0.2),
+        min_confidence: float = 0.5,
+        margin: float = 0.15,
         seed: int = 42,
+        target_age: Optional[str] = None
     ):
         self.dataset_name = dataset_name.lower()
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.target_size = target_size
         self.split_ratios = split_ratios
+        self.min_confidence = min_confidence
+        self.margin = margin
         self.seed = seed
+        self.target_age = target_age.strip().lower() if target_age else None
 
+        self._face_detector = None 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         random.seed(self.seed)
+
+
+    @property
+    def face_detector(self):
+        """Lazily initializes and returns a MediaPipe face detector."""
+        if self._face_detector is None:
+            self._face_detector = mp.solutions.face_detection.FaceDetection(
+                model_selection=1, min_detection_confidence=self.min_confidence
+            )
+        return self._face_detector
+
+
+    def extract_face_crop(
+            self,
+            image: Image.Image,
+            fallback_ratio: Optional[float] = 0.35
+    ) -> Image.Image:
+        """Generic face detection and cropping using MediaPipe, with optional fallback."""
+        img_rgb = np.array(image.convert("RGB"))
+        h_img, w_img, _ = img_rgb.shape
+
+        results = self.face_detector.process(img_rgb)
+        if results.detections:
+            detection = max(results.detections, key=lambda d: d.score[0])
+            bbox = detection.location_data.relative_bounding_box
+
+            x_min, y_min = int(bbox.xmin * w_img), int(bbox.ymin * h_img)
+            w, h = int(bbox.width * w_img), int(bbox.height * h_img)
+
+            dw, dh = int(w * self.margin), int(h * self.margin)
+            x1, y1 = max(0, x_min - dw), max(0, y_min - dh)
+            x2, y2 = min(w_img, x_min + w + dw), min(h_img, y_min + h + dh)
+
+            if x2 > x1 and y2 > y1:
+                return image.crop((x1, y1, x2, y2))
+             
+        if fallback_ratio is not None:
+            head_h = max(1, int(h_img * fallback_ratio))
+            return image.crop((0, 0, w_img, head_h))
+
+        return image
+
 
     def process_image_to_pixel_string(self, img_input: Union[Image.Image, np.ndarray]) -> str:
         """Converts PIL Image or numpy array to a space-separated 1D grayscale pixel string."""
@@ -66,6 +116,10 @@ class PreprocessDataset(ABC):
 
         pixel_array = np.array(gray_img, dtype=np.uint8).flatten()
         return " ".join(pixel_array.astype(str))
+
+    def predict_age(self, img_input: Union[Image.Image, np.ndarray]) -> Optional[str]:
+        """Placeholder for age prediction; can be overridden in subclasses."""
+        return None
 
     # -------------------------------------------------------------------------
     # Abstract Methods to Implement in Subclasses
@@ -155,26 +209,42 @@ class PreprocessDataset(ABC):
             rows.append(row)
 
         df = pd.DataFrame(rows)
-        output_path = self.output_dir / f"{split_name}-{self.dataset_name}.csv"
+
+        if self.target_age:
+            age_suffix = "child" if self.target_age == "child" else self.target_age
+            filename = f"{split_name}-{self.dataset_name}-{age_suffix}.csv"
+        else:
+            filename = f"{split_name}-{self.dataset_name}.csv"
+
+        output_path = self.output_dir / filename
         df.to_csv(output_path, index=False)
         print(f"[{self.dataset_name.upper()}] Saved {split_name:<5} split ({len(df):>6} samples) -> {output_path}")
 
+
+    def close(self) -> None:
+        """Closes any resources (e.g., MediaPipe face detector)."""
+        if self._face_detector is not None:
+            self._face_detector.close()
+            self._face_detector = None
 
 
     def process(self) -> None:
         """Template Method executing the end-to-end preprocessing pipeline."""
         print(f"\n--- Starting Processing for {self.dataset_name.upper()} ---")
-        parsed_dict = self.parse_samples()
-        print(f"[{self.dataset_name.upper()}] Parsed {sum(len(v) for v in parsed_dict.values())} valid samples.")
+        try:
+            parsed_dict = self.parse_samples()
+            print(f"[{self.dataset_name.upper()}] Parsed {sum(len(v) for v in parsed_dict.values())} valid samples.")
 
+            if "all" in parsed_dict:
+                splits = self.split_dataset(parsed_dict["all"])
+            else:
+                splits = parsed_dict  # Already split
 
-        if "all" in parsed_dict:
-            splits = self.split_dataset(parsed_dict["all"])
-        else:
-            splits = parsed_dict  # Already split
-
-        for split_name, split_samples in splits.items():
-            self.save_split_csv(split_samples, split_name)
+            for split_name, split_samples in splits.items():
+                self.save_split_csv(split_samples, split_name)
+        finally:
+            self.close()
+            print(f"--- Finished Processing for {self.dataset_name.upper()} ---\n")
 
 
 class PreprocessAFEW(PreprocessDataset):
@@ -189,73 +259,67 @@ class PreprocessAFEW(PreprocessDataset):
         min_confidence: float = 0.5,
         margin: float = 0.15,
         seed: int = 42,
+        target_age: Optional[str] = None
     ):
-        super().__init__("afew", data_dir=data_dir, output_dir=output_dir, target_size=target_size, split_ratios=split_ratios, seed=seed)
-        self.min_confidence = min_confidence
-        self.margin = margin
-        self.mp_face_detection = mp.solutions.face_detection
+        super().__init__(
+            "afew",
+            data_dir=data_dir,
+            output_dir=output_dir,
+            target_size=target_size,
+            split_ratios=split_ratios,
+            min_confidence=min_confidence,
+            margin=margin,
+            seed=seed,
+            target_age=target_age,
+        )
 
 
-
-    def crop_sample(self, raw_source: Image.Image, face_detector) -> Image.Image:
-        """Detects face bounding box using MediaPipe and crops PIL Image."""
-        img_rgb = np.array(raw_source.convert("RGB"))
-        h_img, w_img, _ = img_rgb.shape
-
-        results = face_detector.process(img_rgb) if face_detector else None
-        if not results or not results.detections:
-            return raw_source  # Return original if no face detected
-
-        detection = max(results.detections, key=lambda d: d.score[0])
-        bbox = detection.location_data.relative_bounding_box
-
-        x_min, y_min = int(bbox.xmin * w_img), int(bbox.ymin * h_img)
-        w, h = int(bbox.width * w_img), int(bbox.height * h_img)
-
-        dw, dh = int(w * self.margin), int(h * self.margin)
-        x1, y1 = max(0, x_min - dw), max(0, y_min - dh)
-        x2, y2 = min(w_img, x_min + w + dw), min(h_img, y_min + h + dh)
-
-        return raw_source.crop((x1, y1, x2, y2))
+    def crop_sample(self, raw_source: Image.Image) -> Image.Image:
+        """Crops a single frame using MediaPipe face detection with margin and fallback."""
+        return self.extract_face_crop(raw_source, fallback_ratio=None)
     
 
     def parse_samples(self) -> Dict[str, List[VADSample]]:
         video_dirs = sorted([d for d in self.data_dir.iterdir() if d.is_dir()])
         all_samples: List[VADSample] = []
 
-        with self.mp_face_detection.FaceDetection(
-            model_selection=0, min_detection_confidence=self.min_confidence
-        ) as face_detector:
+        for video_dir in tqdm(video_dirs, desc="[AFEW] Parsing frames"):
+            json_files = list(video_dir.glob("*.json"))
+            if not json_files:
+                continue
 
-            for video_dir in tqdm(video_dirs, desc="[AFEW] Parsing frames"):
-                json_files = list(video_dir.glob("*.json"))
-                if not json_files:
-                    continue
+            with open(json_files[0], "r", encoding="utf-8") as f:
+                meta = json.load(f)
 
-                with open(json_files[0], "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-
-                for frame_id, frame_info in meta.get("frames", {}).items():
-                    img_path = video_dir / f"{frame_id}.png"
+            for frame_id, frame_info in meta.get("frames", {}).items():
+                img_path = video_dir / f"{frame_id}.png"
+                if not img_path.exists():
+                    img_path = video_dir / f"{frame_id}.jpg"
                     if not img_path.exists():
-                        img_path = video_dir / f"{frame_id}.jpg"
-                        if not img_path.exists():
+                        continue
+
+                with Image.open(img_path) as img:
+
+                    # Hook for future age-based filtering; currently a placeholder
+                    if self.target_age:
+                        age_val = self.predict_age(img)
+                        if age_val and age_val.lower() != self.target_age:
                             continue
 
-                    with Image.open(img_path) as img:
-                        cropped_img = self.crop_sample(img, face_detector=face_detector)
-                        pixel_str = self.process_image_to_pixel_string(cropped_img)
+                    cropped_img = self.crop_sample(img)
+                    pixel_str = self.process_image_to_pixel_string(cropped_img)
 
-                    all_samples.append(
-                        VADSample(
-                            name=f"{video_dir.name}_{frame_id}",
-                            valence=float(frame_info["valence"]),
-                            arousal=float(frame_info["arousal"]),
-                            dominance=None,
-                            pixels=pixel_str,
-                            group_id=video_dir.name,  # Assign video name as group_id
-                        )
+                all_samples.append(
+                    VADSample(
+                        name=f"{video_dir.name}_{frame_id}",
+                        valence=float(frame_info["valence"]),
+                        arousal=float(frame_info["arousal"]),
+                        dominance=None,
+                        pixels=pixel_str,
+                        group_id=video_dir.name,  # Assign video name as group_id
+                        age=age_val if self.target_age else None
                     )
+                )
         return {"all": all_samples}
     
 
@@ -270,9 +334,22 @@ class PreprocessEMOTIC(PreprocessDataset):
         split_ratios: Tuple[float, float, float] = (0.6, 0.2, 0.2),
         target_size: Tuple[int, int] = (112, 112),
         include_extra: bool = False,
+        min_confidence: float = 0.5,
+        margin: float = 0.15,
         seed: int = 42,
+        target_age: Optional[str] = None,
     ):
-        super().__init__("emotic", data_dir=data_dir, output_dir=output_dir, target_size=target_size, split_ratios=split_ratios, seed=seed)
+        super().__init__(
+            "emotic", 
+            data_dir=data_dir, 
+            output_dir=output_dir, 
+            target_size=target_size, 
+            split_ratios=split_ratios, 
+            min_confidence=min_confidence,
+            margin=margin,
+            seed=seed,
+            target_age=target_age
+        )
         self.include_extra = include_extra
         self.annots_dir = self.data_dir / "annots_arrs"
         self.img_arrs_dir = self.data_dir / "img_arrs"
@@ -281,25 +358,28 @@ class PreprocessEMOTIC(PreprocessDataset):
     def crop_sample(
         self, 
         raw_source: Union[Image.Image, np.ndarray], 
-        bbox: Tuple[float, float, float, float] = None
+        bbox: Optional[Tuple[float, float, float, float]] = None
     ) -> Image.Image:
-        """Overrides crop_sample with coordinate-based bounding box cropping."""
-        if bbox is None:
-            return raw_source if isinstance(raw_source, Image.Image) else Image.fromarray(raw_source)
-
-        x_min, y_min, x_max, y_max = bbox
+        """Crops the body bounding box from the image and then applies face detection for final cropping."""
         if not isinstance(raw_source, Image.Image):
             img = Image.fromarray(np.asarray(raw_source, dtype=np.uint8))
         else:
             img = raw_source
 
-        width, height = img.size
-        x1, x2 = max(0, int(x_min)), min(width, int(x_max))
-        y1, y2 = max(0, int(y_min)), min(height, int(y_max))
+        if bbox is not None:
+            x_min, y_min, x_max, y_max = bbox
+            w, h = img.size
+            x1, x2 = max(0, int(x_min)), min(w, int(x_max))
+            y1, y2 = max(0, int(y_min)), min(h, int(y_max))
 
-        if x2 <= x1 or y2 <= y1:
-            return img
-        return img.crop((x1, y1, x2, y2))
+            if x2 > x1 and y2 > y1:
+                body_crop = img.crop((x1, y1, x2, y2))
+            else:
+                body_crop = img
+        else:
+            body_crop = img
+
+        return self.extract_face_crop(body_crop)
 
 
     def parse_samples(self) -> Dict[str, List[VADSample]]:
@@ -354,6 +434,11 @@ class PreprocessEMOTIC(PreprocessDataset):
         samples: List[VADSample] = []
 
         for idx, row in tqdm(df.iterrows(), total=len(df), desc=f"[EMOTIC] {csv_file.name}"):
+
+            age_val = str(row["Age"]).strip().lower() if "Age" in row and pd.notna(row["Age"]) else None
+            if self.target_age and age_val != ("kid" if self.target_age == "child" else self.target_age):
+                continue
+
             # Validate VAD values
             v_val, a_val, d_val = row["Valence"], row["Arousal"], row["Dominance"]
             if not (np.isfinite(v_val) and np.isfinite(a_val) and np.isfinite(d_val)):
@@ -402,6 +487,7 @@ class PreprocessEMOTIC(PreprocessDataset):
                         arousal=float(a_val),
                         dominance=float(d_val),
                         pixels=pixel_str,
+                        age=age_val
                     )
                 )
 
@@ -409,12 +495,116 @@ class PreprocessEMOTIC(PreprocessDataset):
 
 
 
+class PreprocessHECO(PreprocessDataset):
+    """Preprocessor for the HECO dataset with body crop and face detection."""
+
+    def __init__(
+        self,
+        data_dir: Union[str, Path] = "../Data/VAD/HECO",
+        output_dir: Union[str, Path] = "./data",
+        split_ratios: Tuple[float, float, float] = (0.6, 0.2, 0.2),
+        target_size: Tuple[int, int] = (112, 112),
+        min_confidence: float = 0.4,
+        margin: float = 0.15,
+        seed: int = 42,
+        target_age: Optional[str] = None,
+    ):
+        super().__init__(
+            "heco",
+            data_dir=data_dir,
+            output_dir=output_dir,
+            target_size=target_size,
+            split_ratios=split_ratios,
+            min_confidence=min_confidence,
+            margin=margin,
+            seed=seed,
+            target_age=target_age
+        )
+        self.images_dir = self.data_dir / "Data"
+        self.labels_file = self.data_dir / "Labels" / "HECO_Labels.csv"
+
+    def crop_sample(
+        self, 
+        raw_source: Union[Image.Image, np.ndarray], 
+        bbox: Optional[Tuple[float, float, float, float]] = None
+    ) -> Image.Image:
+        """Crops the body bounding box, then detects and crops the face inside it via base class."""
+        if not isinstance(raw_source, Image.Image):
+            img = Image.fromarray(np.asarray(raw_source, dtype=np.uint8))
+        else:
+            img = raw_source
+
+        if bbox is not None:
+            x_min, y_min, x_max, y_max = bbox
+            w, h = img.size
+            x1, x2 = max(0, int(x_min)), min(w, int(x_max))
+            y1, y2 = max(0, int(y_min)), min(h, int(y_max))
+
+            if x2 > x1 and y2 > y1:
+                body_crop = img.crop((x1, y1, x2, y2))
+            else:
+                body_crop = img
+        else:
+            body_crop = img
+
+        return self.extract_face_crop(body_crop, fallback_ratio=0.35)
+
+    def parse_samples(self) -> Dict[str, List[VADSample]]:
+        """Parses HECO metadata and crops corresponding face regions."""
+        if not self.labels_file.exists():
+            raise FileNotFoundError(f"Labels file not found at {self.labels_file}")
+
+        df = pd.read_csv(self.labels_file)
+        samples: List[VADSample] = []
+
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="[HECO] Parsing samples"):
+            img_name = str(row["Image"])
+            img_path = self.images_dir / img_name
+
+            if not img_path.exists():
+                continue
+
+            v_val, a_val, d_val = row["Valence"], row["Arousal"], row["Dominance"]
+            if not (np.isfinite(v_val) and np.isfinite(a_val) and np.isfinite(d_val)):
+                continue
+
+            bbox = (row["xmin"], row["ymin"], row["xmax"], row["ymax"])
+
+            try:
+                with Image.open(img_path) as raw_img:
+                    cropped_face = self.crop_sample(raw_img, bbox=bbox)
+                    pixel_str = self.process_image_to_pixel_string(cropped_face)
+
+                    # Hook for future age-based filtering; currently a placeholder
+                    if self.target_age:
+                        age_val = self.predict_age(cropped_face)
+                        if age_val and age_val.lower() != self.target_age:
+                            continue
+
+                samples.append(
+                    VADSample(
+                        name=f"{Path(img_name).stem}_{idx}",
+                        valence=float(v_val),
+                        arousal=float(a_val),
+                        dominance=float(d_val),
+                        pixels= pixel_str,
+                        age=age_val if self.target_age else None
+                    )
+                )
+            except Exception:
+                continue
+
+        return {"all": samples}
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="Preprocess continuous VAD emotion datasets.")
-    parser.add_argument("--dataset", type=str, required=True, choices=["afew", "emotic", "all"], help="Dataset to preprocess")
+    parser.add_argument("--dataset", type=str, required=True, choices=["afew", "emotic", "heco", "all"], help="Dataset to preprocess")
     parser.add_argument("--data_dir", type=str, default=None, help="Root path to input dataset directory")
     parser.add_argument("--output_dir", type=str, default="./data", help="Path to output processed CSVs")
     parser.add_argument("--image_size", type=int, default=112, help="Output image size (width & height)")
+    parser.add_argument("--target_age", type=str, default=None, choices=["child", "adult"], help="Filter samples by target age group")
     parser.add_argument("--include_extra", action="store_true", help="Include EMOTIC extra training data")
     args = parser.parse_args()
 
@@ -422,7 +612,7 @@ def main():
 
     if args.dataset in ["afew", "all"]:
         afew_dir = args.data_dir if args.data_dir else "../Data/VA/AFEW-VA"
-        afew_processor = PreprocessAFEW(data_dir=afew_dir, output_dir=args.output_dir, target_size=size)
+        afew_processor = PreprocessAFEW(data_dir=afew_dir, output_dir=args.output_dir, target_size=size, target_age=args.target_age)
         afew_processor.process()
 
     if args.dataset in ["emotic", "all"]:
@@ -431,10 +621,18 @@ def main():
             data_dir=emotic_dir, 
             output_dir=args.output_dir, 
             target_size=size, 
+            target_age=args.target_age,
             include_extra=args.include_extra
         )
         emotic_processor.process()
 
+
+    if args.dataset in ["heco", "all"]:
+            heco_dir = args.data_dir if args.data_dir else "../Data/VAD/HECO"
+            heco_processor = PreprocessHECO(data_dir=heco_dir, output_dir=args.output_dir, target_size=size, target_age=args.target_age)
+            heco_processor.process()
+
+        
 
 if __name__ == "__main__":
     main()
