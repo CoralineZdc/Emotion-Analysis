@@ -48,7 +48,7 @@ Options:
 ```bash
   -h, --help            show this help message and exit
   --seed SEED           Random seed for reproducibility (default: 42)
-  --dataset {fer,caers,afew}
+  --dataset {fer,caers,afew,emotic,heco}
                         Dataset to use for training and evaluation (default: fer)
   --input_size INPUT_SIZE
                         Image spatial resolution (default: 112)
@@ -62,18 +62,24 @@ Options:
                         Batch size for training (default: 32)
   --epochs EPOCHS       Number of training epochs (default: 100)
   --learning_rate LEARNING_RATE
-                        Learning rate for the optimizer (default: 1e-4)
+                        Learning rate for the optimizer head (default: 1e-4)
+  --backbone_lr_scale BACKBONE_LR_SCALE
+                        Scale factor for backbone learning rate relative to head LR (default: 0.1)
+  --unfreeze_epoch UNFREEZE_EPOCH
+                        Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)
   --weight_decay WEIGHT_DECAY
                         Weight decay for the optimizer (default: 5e-4)
   --model {vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,efficientnet,mobilenet,mobilefacenet}
                         Model architecture to use (default: vgg16)
   --pretrained          Use pre-trained weights (default: False)
+  --weights_source {imagenet,custom}
+                        Source of pre-trained weights (default: imagenet)
   --freezed             Freeze the convolutional layers of the model (default: False)
   --dropout_rate DROPOUT_RATE
                         Dropout rate for the regression head (default: 0.5)
   --optimizer {adam,sgd,adamw}
                         Optimizer to use for training (default: sgd)
-  --device {cuda,cpu}   Device to use for training (default: cuda)
+  --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
   --grad_clip GRAD_CLIP
                         Gradient clipping value (default: 0.0, no clipping)
   --data_augmentation   Apply data augmentation during training (default: False)
