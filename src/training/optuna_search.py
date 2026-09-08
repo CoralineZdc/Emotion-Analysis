@@ -48,6 +48,8 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, log_csv_p
     opt.criterion = trial.suggest_categorical("criterion", ["ccc", "mse", "combined"])
     if opt.criterion == "combined":
         opt.ccc_weight = trial.suggest_float("ccc_weight", 0.1, 0.9, step=0.1)
+    else:
+        opt.ccc_weight = 0.0
 
     opt.orth_loss_weight = trial.suggest_float("orth_loss_weight", 0.0, 1.0, step=0.1)
     opt.lr_factor = trial.suggest_categorical("lr_factor", [0.1, 0.5])
@@ -94,26 +96,34 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, log_csv_p
         # 3. Comprehensive Logging to CSV
         # ---------------------------------------------------------
         file_exists = os.path.exists(log_csv_path)
+
+        fixed_param_keys = [
+            "weights_source", "unfreeze_epoch", "input_size", "learning_rate", 
+            "weight_decay", "backbone_lr_scale", "optimizer", "batch_size", 
+            "dropout_rate", "weight_v", "weight_a", "weight_d", "criterion", 
+            "ccc_weight", "orth_loss_weight", "lr_factor", "lr_patience"
+        ]
+
         with open(log_csv_path, "a", newline="") as f:
             writer = csv.writer(f)
 
             rmse_header = [f"rmse_{name}" for name in target_names] if target_names else ["rmse_Valence", "rmse_Arousal", "rmse_Dominance"]
             
             if not file_exists:
-                header = ["trial_num", "status", "mean_rmse", "val_loss"] + rmse_header + ["duration_sec"] + list(trial.params.keys()) + ["VAD_weights_normalized"]
+                header = ["trial_num", "status", "mean_rmse", "val_loss"] + rmse_header + ["duration_sec"] + fixed_param_keys + ["VAD_weights_normalized"]
                 writer.writerow(header)
 
             rmse_values = [trial.user_attrs.get(f"val_rmse_{name}", "N/A") for name in target_names] if target_names else ["N/A"] * 3
+            param_values = [trial.params.get(k, getattr(opt, k, "N/A")) for k in fixed_param_keys]
             row = [
                 trial.number,
                 status,
                 round(mean_rmse, 4) if mean_rmse != float("inf") else "N/A",
                 round(best_val_loss, 4) if best_val_loss != float("inf") else "N/A",
-            ] + rmse_values + [elapsed_time] + list(trial.params.values()) + [str(opt.VAD_weights)]
+            ] + rmse_values + [elapsed_time] + param_values + [str(opt.VAD_weights)]
             
             writer.writerow(row)
 
-    # Optuna minimizes this return value
     return mean_rmse
 
 
@@ -133,7 +143,6 @@ def main():
     summary_txt_path = os.path.join(opt.log_dir, f"{opt.study_name}_{opt.dataset}_summary.txt")
 
     sampler = TPESampler(seed=opt.optuna_seed)
-    # Hyperband (ASHA) early stopping strategy
     pruner = HyperbandPruner(
         min_resource=3,
         max_resource=getattr(opt, "epochs", 30),

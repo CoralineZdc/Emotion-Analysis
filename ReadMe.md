@@ -137,6 +137,38 @@ Options:
   --dir DIR   Directory containing log.csv files.
 ```
 
+6.Run hyperparameter optimization using optuna
+
+*Work in Progress*
+
+7.Analyze HPO results
+
+Analyze Optuna Trial CSV Logs and displays :
+
+- Best configurations
+- Categorical and discrete parameter summary
+- Statistical parameter importance and parameter recommandations
+- Prune propensity analysis (parameters triggering pruning)
+- Joint VAD weight vector analysis
+
+```bash
+python -m src.evaluation.analyze_optuna_log
+```
+
+Options:
+
+```bash
+  -h, --help            show this help message and exit
+  --csv_path [CSV_PATH]
+                        Optional path to trial CSV file
+  --search_dir SEARCH_DIR
+                        Directory to search if csv_path is not specified
+  --top_k TOP_K         Number of top trials to display
+  --save                Save text report of the analysis output
+  --output_dir OUTPUT_DIR
+                        Directory where saved report files are stored
+```
+
 ## Repository Layout
 
 - `data/`: untracked, store the dataset csvs
