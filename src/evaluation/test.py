@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from pathlib import Path
 import optuna
+from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 
 
 # Navigate UP 3 levels: evaluation -> src -> Project Root
@@ -14,7 +15,6 @@ if project_root not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from src.utils.data_loader import DataLoader
-from src.utils.transforms import Compose, Resize, ToTensor, Normalize
 from src.utils.training_utils import load_model, compute_batch_loss
 
 

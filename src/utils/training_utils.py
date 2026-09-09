@@ -36,82 +36,105 @@ def clip_gradient(optimizer: torch.optim.Optimizer, grad_clip: float) -> None:
                 param.grad.data.clamp_(-grad_clip, grad_clip)
 
 
-def _normalize_state_dict_key(key: str) -> str:
-    """Normalize layer keys by their numeric index and final tensor attribute."""
+def _clean_onnx_prefix(key: str) -> str:
+    """Strip common wrapper and ONNX graph node prefixes from state_dict keys."""
     if not isinstance(key, str):
         return str(key)
-
-    normalized = key.lower().replace('module.', '').replace('backbone.', '')
-    normalized = normalized.replace('features_', 'features.')
-    normalized = normalized.replace('classifier_', 'classifier.')
-    normalized = normalized.replace('bn_', 'bn.')
-    normalized = normalized.replace('running_mean', 'running.mean')
-    normalized = normalized.replace('running_var', 'running.var')
-    normalized = normalized.replace('num_batches_tracked', 'num.batches.tracked')
-    normalized = normalized.replace('_', '.')
-
-    if normalized.startswith('_initializer_'):
-        return normalized
-
-    match = re.search(r'(\d+)(?:\.(.*))?$', normalized)
-    if not match:
-        return normalized
-
-    layer_idx = match.group(1)
-    suffix = (match.group(2) or '').strip('.')
-    if suffix:
-        return f"{layer_idx}.{suffix}"
-    return layer_idx
+    
+    clean = key
+    # Remove module/body/initializer prefixes
+    for prefix in ["module.", "body.", "_initializer_", "onnx::"]:
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            
+    # Remove leading ONNX graph paths (e.g., "/backbone/layer1/Conv" -> "layer1/Conv")
+    clean = re.sub(r"^/.*?/", "", clean)
+    return clean
 
 
-def _match_model_state_dict(model: torch.nn.Module, pretrained_weights: dict) -> dict:
-    """Map checkpoint tensors to model keys using a name match, then a shape-based fallback for renamed ONNX/exported checkpoints."""
-    if not isinstance(pretrained_weights, dict):
+def _adapt_channel_weights(src_tensor: torch.Tensor, tgt_tensor: torch.Tensor) -> Optional[torch.Tensor]:
+    """Adapt 3-channel (RGB) weights to 1-channel (Grayscale) or vice-versa for input conv layers."""
+    if src_tensor.shape == tgt_tensor.shape:
+        return src_tensor
+
+    # Match 4D Conv weights where only input channels (dim 1) differ
+    if src_tensor.ndim == 4 and tgt_tensor.ndim == 4:
+        s_out, s_in, h, w = src_tensor.shape
+        t_out, t_in, th, tw = tgt_tensor.shape
+        if s_out == t_out and h == th and w == tw:
+            if s_in == 3 and t_in == 1:
+                # Average RGB channels into 1 channel
+                return src_tensor.mean(dim=1, keepdim=True)
+            elif s_in == 1 and t_in == 3:
+                # Repeat 1 channel across 3 RGB channels
+                return src_tensor.repeat(1, 3, 1, 1) / 3.0
+
+    return None
+
+
+def _match_model_state_dict(model: torch.nn.Module, raw_state_dict: dict) -> dict:
+    """
+    Robustly maps checkpoint tensors to model parameters using:
+    1. Name-based and prefix-aware matching.
+    2. Automatic 3-channel to 1-channel input weight adaptation.
+    3. Unused-pool shape-based fallback matching.
+    """
+    if not isinstance(raw_state_dict, dict):
         return {}
 
     model_state = model.state_dict()
-    checkpoint_items = list(enumerate(pretrained_weights.items()))
-    checkpoint_aliases = {}
-    for idx, (checkpoint_key, tensor) in checkpoint_items:
-        normalized = _normalize_state_dict_key(checkpoint_key)
-        checkpoint_aliases.setdefault(normalized, []).append((idx, checkpoint_key, tensor))
-
     matched = {}
-    used_indices = set()
+    used_raw_keys = set()
 
-    for model_key, model_tensor in model_state.items():
-        model_aliases = {
-            _normalize_state_dict_key(model_key),
-            model_key.lower().replace('backbone.', ''),
-            model_key.lower().split('.')[-1],
-        }
+    # Pass 1: Name and prefix alignment
+    for raw_key, src_tensor in raw_state_dict.items():
+        clean_key = _clean_onnx_prefix(raw_key)
 
-        for alias in model_aliases:
-            candidates = checkpoint_aliases.get(alias, [])
-            for idx, checkpoint_key, checkpoint_tensor in candidates:
-                if idx in used_indices:
-                    continue
-                if checkpoint_tensor.shape == model_tensor.shape:
-                    matched[model_key] = checkpoint_tensor
-                    used_indices.add(idx)
-                    break
-            if model_key in matched:
-                break
-
-    for model_key, model_tensor in model_state.items():
-        if model_key in matched:
+        # Skip final regression/classification head weights
+        if any(ignored in clean_key.lower() for ignored in ["head.", "fc.", "classifier.6", "output."]):
             continue
-        for idx, (checkpoint_key, checkpoint_tensor) in checkpoint_items:
-            if idx in used_indices:
+
+        candidates = [
+            clean_key,
+            f"backbone.{clean_key}",
+            clean_key.replace("backbone.", ""),
+            clean_key.replace("conv_stem", "_conv_stem"),
+            f"backbone.{clean_key.replace('conv_stem', '_conv_stem')}"
+        ]
+
+        for cand in candidates:
+            if cand in model_state and cand not in matched:
+                tgt_tensor = model_state[cand]
+                adapted_tensor = _adapt_channel_weights(src_tensor, tgt_tensor)
+                if adapted_tensor is not None:
+                    matched[cand] = adapted_tensor
+                    used_raw_keys.add(raw_key)
+                    break
+
+    # Pass 2: Unused-pool shape-based matching (Fixes index skip bug)
+    unmatched_model_keys = [
+        k for k in model_state.keys() 
+        if k not in matched and not any(h in k for h in ["head.", "classifier.6"])
+    ]
+    
+    unused_raw_items = [
+        (k, v) for k, v in raw_state_dict.items() 
+        if k not in used_raw_keys and not any(h in k.lower() for h in ["fc", "head", "output"])
+    ]
+
+    for m_key in unmatched_model_keys:
+        tgt_tensor = model_state[m_key]
+        for r_key, src_tensor in unused_raw_items:
+            if r_key in used_raw_keys:
                 continue
-            if checkpoint_tensor.shape == model_tensor.shape:
-                matched[model_key] = checkpoint_tensor
-                used_indices.add(idx)
+
+            adapted_tensor = _adapt_channel_weights(src_tensor, tgt_tensor)
+            if adapted_tensor is not None:
+                matched[m_key] = adapted_tensor
+                used_raw_keys.add(r_key)
                 break
 
     return matched
-
-
 
 def load_pretrained_weights(
         model: torch.nn.Module, 
@@ -119,7 +142,7 @@ def load_pretrained_weights(
         weights_source: str = "imagenet",
         display: bool = True
     ) -> Tuple[torch.nn.Module, Optional[str]]:
-    """Load pretrained weights into the model, ignoring mismatched layers."""
+    """Load pretrained weights into the model, handling ONNX conversion and channel alignment."""
     raw_state_dict = None
     dataset_name = "unknown"
     source_label = ""
@@ -141,23 +164,26 @@ def load_pretrained_weights(
             tv_model = tv_models.get_model(tv_arch, weights="DEFAULT")
             raw_state_dict = tv_model.state_dict()
             dataset_name = "imagenet"
-            source_label = f"torchvision ImageNet weights"
+            source_label = "torchvision ImageNet weights"
         except Exception as e:
-            print(f"Error loading torchvision weights for {model_name}: {e}") if display else None
+            if display:
+                print(f"Error loading torchvision weights for {model_name}: {e}")
             return model, "unknown"
 
     elif weights_source == "custom":
         weights_folder = os.path.join(project_root, "models", "weights")
         if not os.path.exists(weights_folder):
-            print(f"Warning: Weights folder '{weights_folder}' does not exist. Skipping weight loading.") if display else None
+            if display:
+                print(f"Warning: Weights folder '{weights_folder}' does not exist. Skipping weight loading.")
             return model, "unknown"
 
         weights_list = os.listdir(weights_folder)
         weight_file = next((file for file in weights_list if model_name.lower() in file.lower()), None)
 
         if weight_file is None:
-            print(f"No pretrained weights found for model: {model_name}") if display else None
-            return model, "unknown"  # Return the model without loading weights
+            if display:
+                print(f"No pretrained weights found for model: {model_name}")
+            return model, "unknown"
 
         file_path = os.path.join(weights_folder, weight_file)
         source_label = f"custom weights from {file_path}"
@@ -165,7 +191,7 @@ def load_pretrained_weights(
         root, extension = os.path.splitext(file_name)
 
         parts = root.split("_")
-        dataset_name = parts[1] if len(parts) > 1 else None  # Assuming the format is model_dataset.pth or model_dataset.pt
+        dataset_name = parts[1] if len(parts) > 1 else None
 
         if extension in [".pth", ".pt"]:
             raw_state_dict = torch.load(file_path, map_location=torch.device('cpu'))
@@ -180,36 +206,31 @@ def load_pretrained_weights(
         raise ValueError(f"Unsupported weights source: {weights_source}. Choose 'imagenet' or 'custom'.")
 
     if raw_state_dict is None or not isinstance(raw_state_dict, dict):
-        print(f"Warning: No valid state_dict found in {source_label}. Skipping weight loading.") if display else None
+        if display:
+            print(f"Warning: No valid state_dict found in {source_label}. Skipping weight loading.")
         return model, dataset_name
 
-    for key in ["state_dict", "model"]:
+    # Unnest state dict wrappers if nested
+    for key in ["state_dict", "model", "net"]:
         if key in raw_state_dict and isinstance(raw_state_dict[key], dict):
             raw_state_dict = raw_state_dict[key]
             break
 
-    model_dict = model.state_dict()
-    matched_dict = {}
-
-    for key, weight_tensor in raw_state_dict.items():
-        clean_key = key[len("module."):] if key.startswith("module.") else key
-
-        candidate_keys = [f"backbone.{clean_key}", clean_key]
-        if clean_key.startswith("backbone."):
-            candidate_keys.append(clean_key[len("backbone."):])
-
-        matched_key = next((k for k in candidate_keys if k in model_dict and model_dict[k].shape == weight_tensor.shape), None)
-        if matched_key:
-            matched_dict[matched_key] = weight_tensor
+    # Use the robust state dict matching function
+    matched_dict = _match_model_state_dict(model, raw_state_dict)
 
     if not matched_dict:
-        print(f"Warning: No compatible weight keys matched for model '{model_name}' in '{source_label}'. ") if display else None
+        if display:
+            print(f"Warning: No compatible weight keys matched for model '{model_name}' in '{source_label}'.")
         return model, dataset_name
 
+    model_dict = model.state_dict()
     model_dict.update(matched_dict)
     model.load_state_dict(model_dict, strict=False)
 
-    print(f"Successfully loaded {len(matched_dict)}/{len(model_dict)} layers from {source_label} for model: {model_name}") if display else None
+    if display:
+        print(f"Successfully loaded {len(matched_dict)}/{len(model_dict)} layers from {source_label} for model: {model_name}")
+        
     return model, dataset_name
 
 
@@ -242,19 +263,23 @@ def load_model(
             num_channels=num_channels, 
             num_outputs=num_outputs, 
             dropout_rate=dropout_rate, 
-            freezed=freezed)
+            freezed=freezed
+        )
     else:
         model = model_class(
             num_channels=num_channels, 
             num_outputs=num_outputs, 
             dropout_rate=dropout_rate, 
-            freezed=freezed)
+            freezed=freezed
+        )
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {model_name} - Trainable params: {trainable_params} / {total_params}") if display else None
-    if trainable_params == 0:
-        print("WARNING: No trainable parameters! Check model freezing logic.") if display else None
+    
+    if display:
+        print(f"Model: {model_name} - Trainable params: {trainable_params} / {total_params}")
+        if trainable_params == 0:
+            print("WARNING: No trainable parameters! Check model freezing logic.")
 
     return model
 
@@ -392,3 +417,19 @@ class CCCLoss(torch.nn.Module):
 
         ccc = (2.0 * covariance) / (var_preds + var_targets + (mean_preds - mean_targets) ** 2 + 1e-8)
         return 1.0 - ccc  # Return 1 - CCC as the loss to minimize
+
+
+def apply_mixup(inputs: torch.Tensor, targets: torch.Tensor, alpha: float = 0.2):
+    """Applies Mixup interpolation to input images and VAD targets."""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = inputs.size(0)
+    index = torch.randperm(batch_size).to(inputs.device)
+
+    mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
+    mixed_targets = lam * targets + (1 - lam) * targets[index]
+    
+    return mixed_inputs, mixed_targets

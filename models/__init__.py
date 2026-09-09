@@ -62,12 +62,16 @@ class Model(nn.Module, ABC):
         return self.head(x)
 
 
-class RegressionHead(nn.Sequential):
-    def __init__(self, in_features, hidden_features, out_features, dropout_rate, activation=nn.SiLU):
-        super().__init__(
-            nn.Dropout(dropout_rate),
+class RegressionHead(nn.Module):
+    def __init__(self, in_features, hidden_features, out_features, dropout_rate):
+        super().__init__()
+        self.net = nn.Sequential(
             nn.Linear(in_features, hidden_features),
-            activation(inplace=True) if activation == nn.ReLU else activation(),
-            nn.SiLU(),
-            nn.Linear(hidden_features, out_features)
+            nn.BatchNorm1d(hidden_features),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_features, out_features)  # <--- NO Sigmoid / Tanh here
         )
+
+    def forward(self, x):
+        return self.net(x)
