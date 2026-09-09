@@ -9,22 +9,7 @@ from torchvision.transforms import v2 as transforms
 from src.evaluation.test import evaluate
 from src.utils.data_loader import DataLoader
 from src.utils.training_utils import *
-
-
-def parse_vad_weights(value: str) -> list[float]:
-    """Parse three VAD loss weights from one command-line argument."""
-    value = value.strip().strip("[]()")
-    try:
-        weights = [float(weight.strip()) for weight in value.split(",")]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "VAD_weights must be three comma-separated numbers, e.g., 1.0,1.0,1.0"
-        ) from exc
-
-    if len(weights) != 3:
-        raise argparse.ArgumentTypeError("VAD_weights must contain exactly three values: V, A, and D")
-    return weights
-
+from src.utils.parsing_utils import parse_csv_floats
 
 def save_checkpoint(state: dict, filename: str) -> None:
     """Save a training checkpoint to disk."""
@@ -352,7 +337,7 @@ def build_parser():
     parser.add_argument("--no_checkpoint", action="store_true", help="Do not save checkpoints (default: False)")
     parser.add_argument("--no_model_save", action="store_true", help="Do not save the model (default: False)")
     parser.add_argument("--criterion", type=str, default="mse", choices=["mse", "ccc", "combined"], help="Loss function to use for training (default: mse)")
-    parser.add_argument("--VAD_weights", type=parse_vad_weights, default=[1.0, 1.0, 1.0], help="Weights for the VAD loss (default: [1.0, 1.0, 1.0])")
+    parser.add_argument("--VAD_weights", type=parse_csv_floats, default="1.0, 1.0, 1.0", help="Weights for the VAD loss (default: \"1.0, 1.0, 1.0\")")
     parser.add_argument("--orth_loss_weight", type=float, default=0.0, help="Weight for the orthogonal loss (default: 0.5)")
     parser.add_argument("--ccc_weight", type=float, default=0.5, help="Weight for the CCC loss (default: 0.5)")
     parser.add_argument("--lr_factor", type=float, default=0.1, help="Factor by which the learning rate will be reduced (default: 0.1)")

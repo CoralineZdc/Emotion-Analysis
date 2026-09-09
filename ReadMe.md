@@ -5,15 +5,15 @@ The dataset used for training is FER2013.
 
 ## Quick Start
 
-1.Install dependencies
+### Install dependencies
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-2.Preprocess datasets
+### Preprocess datasets
 
-Preprocessing pipeline for AFEW and Emotic datasets. Refercences, download links and licences are given in the [Datasets](#datasets) section.
+Preprocessing pipeline for AFEW, Emotic and HECO datasets. Refercences, download links and licences are given in the [Datasets](#datasets) section.
 Datasets will be saved in /data/{split}_{dataset}.csv .
 
 ```bash
@@ -24,17 +24,19 @@ Options:
 
 ```bash
   -h, --help            show this help message and exit
-  --dataset {afew,emotic,all}
+  --dataset {afew,emotic,heco,all}
                         Dataset to preprocess
   --data_dir DATA_DIR   Root path to input dataset directory
   --output_dir OUTPUT_DIR
                         Path to output processed CSVs
   --image_size IMAGE_SIZE
                         Output image size (width & height)
+  --target_age {child,adult}
+                        Filter samples by target age group
   --include_extra       Include EMOTIC extra training data
 ```
 
-3.Train a single model
+### Train a single model
 
 Pipeline for training models from /models on datasets in /data.
 When saved, the weights which gave the best performances can be found in /output/{model}/seed{seed}_dataset-{dataset}_{dataaug if data augmentation enabled}_criterion-{criterion}_{CCCweight{CCC weight} if criterion = "combined"}_V{V weight}_A{A weight}_D{D weight}_opt-{optimizer}_lr{learning}_backboneLRscale{backbone learning rate scale}_bs{batch size}_dropout{dropout rate}/best_model_state.pth .
@@ -89,7 +91,7 @@ Options:
   --criterion {mse,ccc,combined}
                         Loss function to use for training (default: mse)
   --VAD_weights VAD_WEIGHTS
-                        Weights for the VAD loss (default: [1.0, 1.0, 1.0])
+                        Weights for the VAD loss (default: "1.0, 1.0, 1.0")
   --orth_loss_weight ORTH_LOSS_WEIGHT
                         Weight for the orthogonal loss (default: 0.5)
   --ccc_weight CCC_WEIGHT
@@ -107,7 +109,7 @@ Options:
   --lr_min LR_MIN       Lower bound on the learning rate (default: 0.0)
 ```
 
-4.Evaluate a model
+### Evaluate a model
 
 Script to evaluate models trained with the pipeline above on the test dataset.
 
@@ -128,7 +130,7 @@ Options:
                         Path to state dict with weights (.pth).
 ```
 
-5.Plot a loss curve
+### Plot a loss curve
 
 Plots the curves corresponding to all log.csv file located in the specified directory.
 
@@ -143,11 +145,67 @@ Options:
   --dir DIR   Directory containing log.csv files.
 ```
 
-6.Run hyperparameter optimization using optuna
+### Run hyperparameter optimization using optuna
 
-*Work in Progress*
+Runs Hyperparameter Optimization with Optuna on desired model and dataset.
 
-7.Analyze HPO results
+Options:
+
+```bash
+  -h, --help            show this help message and exit
+  --study_name STUDY_NAME
+  --storage STORAGE
+  --log_dir LOG_DIR
+  --resume_study        Resume an existing Optuna study if it exists
+  --dataset {fer,caers,afew,emotic,heco}
+                        Dataset to use for training and evaluation (default: fer)
+  --model {vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,efficientnet,mobilenet,mobilefacenet}
+                        Model architecture to use (default: vgg16)
+  --pretrained          Use pre-trained weights (default: False)
+  --freezed             Freeze the convolutional layers of the model (default: False)
+  --seed SEED           Random seed for reproducibility (default: 42)
+  --optuna_seed OPTUNA_SEED
+                        Random seed for reproducibility
+  --n_trials N_TRIALS   Number of Optuna trials
+  --epochs EPOCHS       Number of training epochs (default: 100)
+  --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
+  --num_workers NUM_WORKERS
+                        DataLoader subprocess workers (default: 4)
+  --output_dir OUTPUT_DIR
+                        Directory to save logs and model checkpoints (default: ./output)
+  --grad_clip GRAD_CLIP
+                        Gradient clipping value (default: 0.0, no clipping)
+                        Factor by which the learning rate will be reduced (default: 0.1)
+  --range_learning_rate RANGE_LEARNING_RATE
+                        Min, Max bounds for LR
+  --range_weight_decay RANGE_WEIGHT_DECAY
+                        Min, Max bounds for weight decay
+  --range_backbone_lr_scale RANGE_BACKBONE_LR_SCALE
+                        Min, Max for backbone LR scaling
+  --range_unfreeze_epoch RANGE_UNFREEZE_EPOCH
+                        Min, Max unfreeze epoch bounds
+  --range_input_size RANGE_INPUT_SIZE
+                        Discrete input resolutions
+  --range_batch_size RANGE_BATCH_SIZE
+                        Discrete batch sizes
+  --range_dropout_rate RANGE_DROPOUT_RATE
+                        Min, Max, Step for dropout
+  --range_weights_source RANGE_WEIGHTS_SOURCE
+                        Weights source options
+  --range_optimizer RANGE_OPTIMIZER
+                        Optimizers to search over
+  --range_criterion RANGE_CRITERION
+                        Criterions to search over
+  --range_ccc_weight RANGE_CCC_WEIGHT
+                        Min, Max, Step for CCC loss weight
+  --range_orth_loss_weight RANGE_ORTH_LOSS_WEIGHT
+                        Min, Max, Step for Orth loss weight
+  --range_lr_factor RANGE_LR_FACTOR
+                        Discrete learning rate decay factors
+  --range_lr_patience RANGE_LR_PATIENCE
+```
+
+### Analyze HPO results
 
 Analyze Optuna Trial CSV Logs and displays :
 
@@ -190,14 +248,30 @@ Options:
 
 ### FER2013 re-labelled
 
-- Source: Huo, Y., & Ge, Y. (2025). *VAD-Net: Multidimensional Facial Expression Recognition in Intelligent Education System.*
+- Source: Huo, Y., & Ge, Y. (2025). _VAD-Net: Multidimensional Facial Expression Recognition in Intelligent Education System._
 - Available at: [https://github.com/YeeHoran/VAD-Net/](https://github.com/YeeHoran/VAD-Net/)
 - Licence: MIT License
 
 ### AFEW-VA
 
 - Sources:
-Kossaifi, J., Tzimiropoulos, G., Todorovic, S., & Pantic, M. (2017). AFEW-VA database for valence and arousal estimation in-the-wild, In *Image and Vision Computing*
-Dhall, A., Goecke, R., Lucey, S., & Gedeon, T. (2012). Collecting Large, Richly Annotated Facial-Expression Databases from Movies, In *IEEE MultiMedia*, (vol. 19, no. 3, pp. 34-41)
+Kossaifi, J., Tzimiropoulos, G., Todorovic, S., & Pantic, M. (2017). AFEW-VA database for valence and arousal estimation in-the-wild, In _Image and Vision Computing_
+Dhall, A., Goecke, R., Lucey, S., & Gedeon, T. (2012). Collecting Large, Richly Annotated Facial-Expression Databases from Movies, In _IEEE MultiMedia_, (vol. 19, no. 3, pp. 34-41)
 - Available at: [https://ibug.doc.ic.ac.uk/resources/afew-va-database/](https://ibug.doc.ic.ac.uk/resources/afew-va-database/)
 - License: Available for research purpose only
+
+### EMOTIC
+
+- Sources:
+Kosti, R., Alvarez, J. M., Recasens, A., & Lapedriza, A. (2020) Context Based Emotion Recognition Using EMOTIC Dataset, In _IEEE Transactions on Pattern Analysis and Machine Intelligence_, (vol. 42, no. 11, pp. 2755-2766)
+Kosti, R., Alvarez, J. M., Recasens, A., & Lapedriza, A. (2017) Emotion Recognition in Context, In _Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition_, (pp. 1667-1675)
+Kosti, R., Alvarez, J. M., Recasens, A., & Lapedriza, A. (2017) EMOTIC: Emotions in Context Dataset, In _Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition Workshops_, (pp. 61-69)
+Kosti, R. (2019) _Visual scene context in emotion perception_. [https://hdl.handle.net/10803/667808](https://hdl.handle.net/10803/667808)
+- Available at: [https://github.com/rkosti/emotic](https://github.com/rkosti/emotic)
+- License: Available for non-commercial research purpose only
+
+### HECO
+
+- Source: Yang, D., Huang, S., Wang, S., Liu, Y., Zhai, P., Su, L., Li, M., & Zhang, L. (2022). Emotion Recognition for Multiple Context Awareness. In _Computer Vision - ECCV 2022_ (Vol. 13697, pp. 144–162).
+- Available at: [https://heco2022.github.io/](https://heco2022.github.io/)
+- License: Unspecified

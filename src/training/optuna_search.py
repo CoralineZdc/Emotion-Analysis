@@ -3,11 +3,54 @@ import copy
 import csv
 import os
 import time
+from typing import Any, List
+
 import optuna
 from optuna.pruners import HyperbandPruner
 from optuna.samplers import TPESampler
 
 from src.training.train import build_parser, run_training
+from src.utils.parsing_utils import parse_csv_floats, parse_csv_ints, parse_csv_strings, parse_csv_bool_tuples
+
+
+# -------------------------------------------------------------------------
+# Helper Functions for Dynamic Hyperparameter Sampling
+# -------------------------------------------------------------------------
+
+def sample_float(trial: optuna.trial.Trial, name: str, bounds: List[float], log: bool = False) -> float:
+    """Samples a float hyperparameter based on length of input range list."""
+    if len(bounds) == 1:
+        return bounds[0]
+    elif len(bounds) == 2:
+        return trial.suggest_float(name, bounds[0], bounds[1], log=log)
+    elif len(bounds) == 3 and not log:
+        return trial.suggest_float(name, bounds[0], bounds[1], step=bounds[2])
+    else:
+        raise ValueError(f"Invalid range specification for float '{name}': {bounds}. Expecting 1, 2, or 3 values.")
+
+
+def sample_int(trial: optuna.trial.Trial, name: str, bounds: List[int]) -> int:
+    """Samples an integer hyperparameter based on length of input range list."""
+    if len(bounds) == 1:
+        return bounds[0]
+    elif len(bounds) == 2:
+        return trial.suggest_int(name, bounds[0], bounds[1])
+    elif len(bounds) == 3:
+        return trial.suggest_int(name, bounds[0], bounds[1], step=bounds[2])
+    else:
+        raise ValueError(f"Invalid range specification for int '{name}': {bounds}. Expecting 1, 2, or 3 values.")
+
+
+def sample_categorical(trial: optuna.trial.Trial, name: str, choices: List[Any]) -> Any:
+    """Picks from discrete values or returns the single choice if only 1 provided."""
+    if len(choices) == 1:
+        return choices[0]
+    return trial.suggest_categorical(name, choices)
+
+
+# -------------------------------------------------------------------------
+# Optuna Objective Function
+# -------------------------------------------------------------------------
 
 
 def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, log_csv_path: str) -> float:
@@ -17,47 +60,45 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, log_csv_p
     # ---------------------------------------------------------
     # 1. Hyperparameter Search Space
     # ---------------------------------------------------------
-    #opt.model = trial.suggest_categorical("model", ["vgg19", "resnet50"])
-    opt.pretrained = True
-    opt.weights_source = trial.suggest_categorical("weights_source", ["imagenet", "custom"])
-    opt.freezed = True
-    opt.unfreeze_epoch = trial.suggest_int("unfreeze_epoch", 0, 15)
-    opt.input_size = trial.suggest_categorical("input_size", [48, 112])
+
+    # Disable disk I/O saving during optimization
+    opt.no_checkpoint = True
+    opt.no_model_save = True
+
+    opt.weights_source = sample_categorical(trial, "weights_source", opt.range_weights_source)
+    opt.unfreeze_epoch = sample_int(trial, "unfreeze_epoch", opt.range_unfreeze_epoch)
+    opt.input_size = sample_categorical(trial, "input_size", opt.range_input_size)
     
-    opt.learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-    opt.weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
-    opt.backbone_lr_scale = trial.suggest_float("backbone_lr_scale", 1e-3, 1.0, log=True)
-    opt.optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
-    opt.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
-    opt.dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.6, step=0.1)
+    opt.learning_rate = sample_float(trial, "learning_rate", opt.range_learning_rate, log=True)
+    opt.weight_decay = sample_float(trial, "weight_decay", opt.range_weight_decay, log=True)
+    opt.backbone_lr_scale = sample_float(trial, "backbone_lr_scale", opt.range_backbone_lr_scale, log=True)
+    opt.optimizer = sample_categorical(trial, "optimizer", opt.range_optimizer)
+    opt.batch_size = sample_categorical(trial, "batch_size", opt.range_batch_size)
+    opt.dropout_rate = sample_float(trial, "dropout_rate", opt.range_dropout_rate)
 
     # VAD Weight Normalization (Ensures sum equals 1.0 to prevent loss tricking)
-    w_v = trial.suggest_float("weight_v", 0.1, 1.0)
-    w_a = trial.suggest_float("weight_a", 0.1, 1.0)
+    w_v = sample_float(trial, "weight_v", [0.0, 1.0])
+    w_a = sample_float(trial, "weight_a", [0.0, 1.0])
     
     if opt.dataset.lower() == "afew":
         w_d = 0.0
         total_w = w_v + w_a
     else:
-        w_d = trial.suggest_float("weight_d", 0.1, 1.0)
+        w_d = sample_float(trial, "weight_d", [0.0, 1.0])
         total_w = w_v + w_a + w_d
 
     opt.VAD_weights = [round(w_v / total_w, 4), round(w_a / total_w, 4), round(w_d / total_w, 4)]
 
     # Loss Criterion Configuration
-    opt.criterion = trial.suggest_categorical("criterion", ["ccc", "mse", "combined"])
+    opt.criterion = sample_categorical(trial, "criterion", opt.range_criterion)
     if opt.criterion == "combined":
-        opt.ccc_weight = trial.suggest_float("ccc_weight", 0.1, 0.9, step=0.1)
+        opt.ccc_weight = sample_float(trial, "ccc_weight", opt.range_ccc_weight)
     else:
         opt.ccc_weight = 0.0
 
-    opt.orth_loss_weight = trial.suggest_float("orth_loss_weight", 0.0, 1.0, step=0.1)
-    opt.lr_factor = trial.suggest_categorical("lr_factor", [0.1, 0.5])
-    opt.lr_patience = trial.suggest_int("lr_patience", 3, 10)
-
-    # Disable disk I/O saving during optimization
-    opt.no_checkpoint = True
-    opt.no_model_save = True
+    opt.orth_loss_weight = sample_float(trial, "orth_loss_weight", opt.range_orth_loss_weight)
+    opt.lr_factor = sample_categorical(trial, "lr_factor", opt.range_lr_factor)
+    opt.lr_patience = sample_int(trial, "lr_patience", opt.range_lr_patience)
 
     start_time = time.time()
     status = "COMPLETE"
@@ -129,12 +170,30 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, log_csv_p
 
 def main():
     parser = build_parser()
+
+    # Mode selection for Optuna hyperparameter search
     parser.add_argument("--n_trials", type=int, default=30, help="Number of Optuna trials")
     parser.add_argument("--optuna_seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--study_name", type=str, default="vad_hyperparameter_tune")
     parser.add_argument("--storage", type=str, default="sqlite:///optuna_vad.db")
     parser.add_argument("--log_dir", type=str, default="./output/optuna_logs")
     parser.add_argument("--resume_study", action="store_true", help="Resume an existing Optuna study if it exists")
+
+    # Dynamic Range Arguments using custom parsing utils
+    parser.add_argument("--range_learning_rate", type=parse_csv_floats, default="1e-5, 1e-2", help="Min, Max bounds for LR")
+    parser.add_argument("--range_weight_decay", type=parse_csv_floats, default="1e-6, 1e-2", help="Min, Max bounds for weight decay")
+    parser.add_argument("--range_backbone_lr_scale", type=parse_csv_floats, default="1e-3, 1.0", help="Min, Max for backbone LR scaling")
+    parser.add_argument("--range_unfreeze_epoch", type=parse_csv_ints, default="0, 15", help="Min, Max unfreeze epoch bounds")
+    parser.add_argument("--range_input_size", type=parse_csv_ints, default="48, 112", help="Discrete input resolutions")
+    parser.add_argument("--range_batch_size", type=parse_csv_ints, default="16, 32, 64", help="Discrete batch sizes")
+    parser.add_argument("--range_dropout_rate", type=parse_csv_floats, default="0.1, 0.6, 0.1", help="Min, Max, Step for dropout")
+    parser.add_argument("--range_weights_source", type=parse_csv_strings, default="imagenet, custom", help="Weights source options")
+    parser.add_argument("--range_optimizer", type=parse_csv_strings, default="adam, adamw, sgd", help="Optimizers to search over")
+    parser.add_argument("--range_criterion", type=parse_csv_strings, default="ccc, mse, combined", help="Criterions to search over")
+    parser.add_argument("--range_ccc_weight", type=parse_csv_floats, default="0.1, 0.9, 0.1", help="Min, Max, Step for CCC loss weight")
+    parser.add_argument("--range_orth_loss_weight", type=parse_csv_floats, default="0.0, 1.0, 0.1", help="Min, Max, Step for Orth loss weight")
+    parser.add_argument("--range_lr_factor", type=parse_csv_floats, default="0.1, 0.5", help="Discrete learning rate decay factors")
+    parser.add_argument("--range_lr_patience", type=parse_csv_ints, default="3, 10", help="Min, Max bounds for scheduler patience")
 
     opt = parser.parse_args()
 
