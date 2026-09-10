@@ -121,12 +121,12 @@ Options:
 
 ```bash  
   -h, --help            show this help message and exit
-  --input-size INPUT_SIZE
+  --input_size INPUT_SIZE
                         Image spatial resolution (default: 48).
   --device {cuda,cpu}   Device to use for evaluation (default: cuda if available, otherwise cpu).
   --split {Test,Val,Train}
                         Data split to evaluate on (default: Test).
-  --state-dict-path STATE_DICT_PATH
+  --state_dict_path STATE_DICT_PATH
                         Path to state dict with weights (.pth).
 ```
 

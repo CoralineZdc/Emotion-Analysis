@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from pathlib import Path
 import optuna
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize
+from torchvision.transforms.v2 import Compose, Resize, ToImage, ToDtype, Normalize
 
 
 # Navigate UP 3 levels: evaluation -> src -> Project Root
@@ -24,13 +24,17 @@ def repo_root() -> str:
 
 def get_simu_params(state_dict_path):
     """Extracts simulation parameters from the directory name of the state_dict_path."""
-    dir_name = Path(state_dict_path).parent.name
+    dir_name = state_dict_path.parent.name
     params = {}
     for param in dir_name.split("_"):
-        idx = next((i for i, c in enumerate(param) if c.isdigit()), len(param))
-        key, value = param[:idx], param[idx:]
-        if not value : key, value = param.split("-")
-        if key : params[key] = value
+        if "-" in param:
+            key, value = param.split("-", 1)
+            params[key] = value
+        else:
+            idx = next((i for i, c in enumerate(param) if c.isdigit()), len(param))
+            key, value = param[:idx], param[idx:]
+            if key:
+                params[key] = value
     return params
 
 
@@ -39,10 +43,10 @@ def evaluate(
         model: torch.nn.Module, 
         criterion_type: str = "mse",
         alpha: float = 0.5,
-        weights: torch.Tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32),
+        weights: torch.Tensor | None = None,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), 
         trial: optuna.trial.Trial | None = None
-    ):
+    ) -> tuple[float, np.ndarray]:
     model.eval()
     total_loss = 0.0
     all_preds, all_targets = [], []
@@ -79,10 +83,10 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="VAD Evaluation (MSE & RMSE per dimension).")
-    parser.add_argument("--input-size", type=int, default=48, help="Image spatial resolution (default: 48).")
+    parser.add_argument("--input_size", type=int, default=48, help="Image spatial resolution (default: 48).")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"], help="Device to use for evaluation (default: cuda if available, otherwise cpu).")
     parser.add_argument("--split", type=str, default="Test", choices=["Test", "Val", "Train"], help="Data split to evaluate on (default: Test).")
-    parser.add_argument("--state-dict-path", type=str, required=True, help="Path to state dict with weights (.pth).")
+    parser.add_argument("--state_dict_path", type=str, required=True, help="Path to state dict with weights (.pth).")
 
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -95,11 +99,18 @@ def main():
     dataset_name = simu_params.get("dataset", "fer")
     dropout_rate = float(simu_params.get("dropout", 0.5))
     batch_size = int(simu_params.get("batch", 64))
+    modelweights = simu_params.get("modelweights", None)
+
+    model_name = state_dict_path.parts[-3] if len(state_dict_path.parts) >=3 else "resnet50"  # Assuming the model name is the third last part of the path
+
+    num_channels = 1 if modelweights == "custom" else 3
+    DataLoader.set_num_channels(num_channels)
 
     # Initialize DataLoader protocol to ensure image and label statistics are computed
     DataLoader.set_data_protocol("small_split")
     DataLoader._ensure_image_stats(dataset_name)
     DataLoader._ensure_label_stats(dataset_name)
+    print(f"Evaluating model on {dataset_name} dataset")
 
     # Determine which dimensions to include based on weights and dataset availability
     weights_list = [float(simu_params.get("V", 1.0)), float(simu_params.get("A", 1.0)), float(simu_params.get("D", 1.0))]
@@ -110,11 +121,10 @@ def main():
     weights = torch.tensor(weights_list, dtype=torch.float32, device=device)
 
     #Instanciate model
-    model_name = state_dict_path.parts[-3]  # Assuming the model name is the third last part of the path
     print(f"Instantiating model {model_name.upper()} with {num_outputs} outputs and dropout rate {dropout_rate}")
     model = load_model(
         model_name=model_name,
-        num_channels=3,
+        num_channels=num_channels,
         num_outputs=num_outputs,
         dropout_rate=dropout_rate
     )
@@ -127,9 +137,12 @@ def main():
     model.to(device)
 
     # Determine image normalization parameters based on whether the model is pretrained or not
-    if "pretrained" in args.state_dict_path:
-        image_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=device)
-        image_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=device)
+    if modelweights == "custom":
+        image_mean = torch.tensor([0.5], dtype=torch.float32, device=device)
+        image_std = torch.tensor([0.5], dtype=torch.float32, device=device)
+    elif modelweights == "imagenet":
+        image_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device)
+        image_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device)
     else:
         image_mean = DataLoader.image_mean.to(device, dtype=torch.float32)
         image_std = DataLoader.image_std.to(device, dtype=torch.float32)
@@ -137,11 +150,18 @@ def main():
     # Evaluation transforms and loader
     test_transform = Compose([
         Resize((args.input_size, args.input_size)),
-        ToTensor(),
+        ToImage(),
+        ToDtype(torch.float32, scale=True),
         Normalize(mean=image_mean.tolist(), std=image_std.tolist())
     ])
 
-    dataset = DataLoader(split=args.split, dataset=dataset_name, transform=test_transform, include_V=include_flags[0], include_A=include_flags[1], include_D=include_flags[2])
+    dataset = DataLoader(
+        split=args.split, 
+        dataset=dataset_name, 
+        transform=test_transform, 
+        include_V=include_flags[0], 
+        include_A=include_flags[1], 
+        include_D=include_flags[2])
     test_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # Run evaluation

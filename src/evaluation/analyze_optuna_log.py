@@ -535,4 +535,5 @@ if __name__ == "__main__":
             
         print(f"Discovered {len(discovered)} Optuna CSV log file(s). Analyzing the latest:")
         print(f" -> {discovered[0]}")
-        analyze_trials(discovered[0], top_k=args.top_k, save=args.save, output_dir=save_dir)
+        for study in discovered:
+            analyze_trials(study, top_k=args.top_k, save=args.save, output_dir=save_dir)
