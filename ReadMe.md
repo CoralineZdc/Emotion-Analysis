@@ -34,6 +34,7 @@ Options:
   --target_age {child,adult}
                         Filter samples by target age group
   --include_extra       Include EMOTIC extra training data
+  --no_resplit          Disable forced-resplitting of dataset and retain original splits if available
 ```
 
 ### Train a single model

@@ -40,7 +40,8 @@ class PreprocessDataset(ABC):
         min_confidence: float = 0.5,
         margin: float = 0.15,
         seed: int = 42,
-        target_age: Optional[str] = None
+        target_age: Optional[str] = None,
+        resplit: bool = True
     ):
         self.dataset_name = dataset_name.lower()
         self.data_dir = Path(data_dir)
@@ -50,6 +51,7 @@ class PreprocessDataset(ABC):
         self.min_confidence = min_confidence
         self.margin = margin
         self.seed = seed
+        self.resplit = resplit
         self.target_age = target_age.strip().lower() if target_age else None
 
         self._face_detector = None 
@@ -142,52 +144,130 @@ class PreprocessDataset(ABC):
     # -------------------------------------------------------------------------
     # Generic Splitting & Export Pipeline
     # -------------------------------------------------------------------------
+    @staticmethod
+    def _compute_range_agnostic_bins(values: np.ndarray, n_bins: int = 4) -> np.ndarray:
+        """Computes discrete bin indices in a range-agnostic manner.
+        
+        Uses quantile binning (percentiles) first; falls back to min-max 
+        uniform binning if quantiles fail due to low variance.
+        """
+        if len(values) == 0:
+            return np.array([], dtype=int)
+            
+        # Strategy 1: Quantile/percentile binning (inherently scale-agnostic)
+        try:
+            return pd.qcut(values, q=n_bins, labels=False, duplicates='drop')
+        except Exception:
+            pass
+
+        # Strategy 2: Dynamic Min-Max normalization fallback
+        v_min, v_max = values.min(), values.max()
+        if np.isclose(v_min, v_max):
+            return np.zeros(len(values), dtype=int)
+
+        normalized = (values - v_min) / (v_max - v_min + 1e-7)
+        return np.clip((normalized * n_bins).astype(int), 0, n_bins - 1)
+
+
     def split_dataset(
-        self, samples: List[VADSample]
-    ) -> Dict[str, List[VADSample]]:
-        """Splits samples into train/val/test using sample-level or group-level partitioning."""
+            self, samples: List[VADSample]
+        ) -> Dict[str, List[VADSample]]:
+        """Splits samples into train/val/test with scale-agnostic VAD/VA stratification and group leakage prevention."""
         train_r, val_r, test_r = self.split_ratios
         if not np.isclose(train_r + val_r + test_r, 1.0):
             raise ValueError("Split ratios must sum up to 1.0")
 
-        # Case A: Group-based split (e.g., group frames by video folder to prevent leakage)
+        rng = random.Random(self.seed)
+
+        # 1. Determine if Dominance is available across samples
+        has_dominance = any(s.dominance is not None for s in samples)
+        n_bins = 3 if has_dominance else 4  # 3^3 = 27 strata vs 4^2 = 16 strata
+
+        # -------------------------------------------------------------
+        # CASE A: Group-Based Splitting (Prevents Data Leakage)
+        # -------------------------------------------------------------
         if any(s.group_id is not None for s in samples):
             groups: Dict[str, List[VADSample]] = {}
             for s in samples:
-                groups.setdefault(s.group_id, []).append(s)
+                gid = s.group_id if s.group_id is not None else s.name
+                groups.setdefault(gid, []).append(s)
 
-            group_keys = list(groups.keys())
-            random.shuffle(group_keys)
+            group_ids = list(groups.keys())
 
-            n_total = len(group_keys)
-            n_train = int(n_total * train_r)
-            n_val = int(n_total * val_r)
+            mean_v = np.array([np.mean([s.valence for s in groups[gid]]) for gid in group_ids])
+            mean_a = np.array([np.mean([s.arousal for s in groups[gid]]) for gid in group_ids])
 
-            train_groups = set(group_keys[:n_train])
-            val_groups = set(group_keys[n_train : n_train + n_val])
+            v_bins = self._compute_range_agnostic_bins(mean_v, n_bins=n_bins)
+            a_bins = self._compute_range_agnostic_bins(mean_a, n_bins=n_bins)
 
-            splits = {"train": [], "val": [], "test": []}
-            for group_id, item_list in groups.items():
-                if group_id in train_groups:
-                    splits["train"].extend(item_list)
-                elif group_id in val_groups:
-                    splits["val"].extend(item_list)
-                else:
-                    splits["test"].extend(item_list)
+            if has_dominance:
+                mean_d = np.array([
+                    np.mean([s.dominance for s in groups[gid] if s.dominance is not None])
+                    for gid in group_ids
+                ])
+                d_bins = self._compute_range_agnostic_bins(mean_d, n_bins=n_bins)
+                strata_keys = [f"{vb}_{ab}_{db}" for vb, ab, db in zip(v_bins, a_bins, d_bins)]
+            else:
+                strata_keys = [f"{vb}_{ab}" for vb, ab in zip(v_bins, a_bins)]
+
+            strata_map: Dict[str, List[Tuple[str, int]]] = {}
+            for gid, stratum in zip(group_ids, strata_keys):
+                strata_map.setdefault(stratum, []).append((gid, len(groups[gid])))
+
+            splits: Dict[str, List[VADSample]] = {"train": [], "val": [], "test": []}
+
+            for stratum, g_list in strata_map.items():
+                rng.shuffle(g_list)
+                tot_stratum_samples = sum(count for _, count in g_list)
+                target_train = tot_stratum_samples * train_r
+                target_val = tot_stratum_samples * val_r
+
+                curr_train, curr_val = 0, 0
+                for gid, count in g_list:
+                    if curr_train < target_train:
+                        splits["train"].extend(groups[gid])
+                        curr_train += count
+                    elif curr_val < target_val:
+                        splits["val"].extend(groups[gid])
+                        curr_val += count
+                    else:
+                        splits["test"].extend(groups[gid])
+
             return splits
 
-        # Case B: Standard sample-level random split
-        shuffled = samples.copy()
-        random.shuffle(shuffled)
-        n_total = len(shuffled)
-        n_train = int(n_total * train_r)
-        n_val = int(n_total * val_r)
+        # -------------------------------------------------------------
+        # CASE B: Standard Sample-Level Stratified Split
+        # -------------------------------------------------------------
+        v_vals = np.array([s.valence for s in samples])
+        a_vals = np.array([s.arousal for s in samples])
 
-        return {
-            "train": shuffled[:n_train],
-            "val": shuffled[n_train : n_train + n_val],
-            "test": shuffled[n_train + n_val :],
-        }
+        v_bins = self._compute_range_agnostic_bins(v_vals, n_bins=n_bins)
+        a_bins = self._compute_range_agnostic_bins(a_vals, n_bins=n_bins)
+
+        if has_dominance:
+            d_vals = np.array([s.dominance if s.dominance is not None else 0.0 for s in samples])
+            d_bins = self._compute_range_agnostic_bins(d_vals, n_bins=n_bins)
+            strata_keys = [f"{vb}_{ab}_{db}" for vb, ab, db in zip(v_bins, a_bins, d_bins)]
+        else:
+            strata_keys = [f"{vb}_{ab}" for vb, ab in zip(v_bins, a_bins)]
+
+        strata_map: Dict[str, List[VADSample]] = {}
+        for s, stratum in zip(samples, strata_keys):
+            strata_map.setdefault(stratum, []).append(s)
+
+        splits: Dict[str, List[VADSample]] = {"train": [], "val": [], "test": []}
+
+        for stratum, s_list in strata_map.items():
+            rng.shuffle(s_list)
+            n_tot = len(s_list)
+            n_tr = int(n_tot * train_r)
+            n_va = int(n_tot * val_r)
+
+            splits["train"].extend(s_list[:n_tr])
+            splits["val"].extend(s_list[n_tr : n_tr + n_va])
+            splits["test"].extend(s_list[n_tr + n_va :])
+
+        return splits
 
 
     def save_split_csv(self, samples: List[VADSample], split_name: str) -> None:
@@ -233,10 +313,14 @@ class PreprocessDataset(ABC):
         print(f"\n--- Starting Processing for {self.dataset_name.upper()} ---")
         try:
             parsed_dict = self.parse_samples()
-            print(f"[{self.dataset_name.upper()}] Parsed {sum(len(v) for v in parsed_dict.values())} valid samples.")
+            total_samples = sum(len(v) for v in parsed_dict.values())
+            print(f"[{self.dataset_name.upper()}] Parsed {total_samples} valid samples.")
 
-            if "all" in parsed_dict:
-                splits = self.split_dataset(parsed_dict["all"])
+            if self.resplit or "all" not in parsed_dict:
+                all_samples = []
+                for sample_list in parsed_dict.values():
+                    all_samples.extend(sample_list)
+                splits = self.split_dataset(all_samples)
             else:
                 splits = parsed_dict  # Already split
 
@@ -245,6 +329,7 @@ class PreprocessDataset(ABC):
         finally:
             self.close()
             print(f"--- Finished Processing for {self.dataset_name.upper()} ---\n")
+
 
 
 class PreprocessAFEW(PreprocessDataset):
@@ -259,7 +344,8 @@ class PreprocessAFEW(PreprocessDataset):
         min_confidence: float = 0.5,
         margin: float = 0.15,
         seed: int = 42,
-        target_age: Optional[str] = None
+        target_age: Optional[str] = None,
+        resplit: bool = True
     ):
         super().__init__(
             "afew",
@@ -271,6 +357,7 @@ class PreprocessAFEW(PreprocessDataset):
             margin=margin,
             seed=seed,
             target_age=target_age,
+            resplit=resplit
         )
 
 
@@ -323,7 +410,6 @@ class PreprocessAFEW(PreprocessDataset):
         return {"all": all_samples}
     
 
-
 class PreprocessEMOTIC(PreprocessDataset):
     """Preprocessor for the EMOTIC VAD dataset."""
 
@@ -338,6 +424,7 @@ class PreprocessEMOTIC(PreprocessDataset):
         margin: float = 0.15,
         seed: int = 42,
         target_age: Optional[str] = None,
+        resplit: bool = True,
     ):
         super().__init__(
             "emotic", 
@@ -348,7 +435,8 @@ class PreprocessEMOTIC(PreprocessDataset):
             min_confidence=min_confidence,
             margin=margin,
             seed=seed,
-            target_age=target_age
+            target_age=target_age,
+            resplit=resplit
         )
         self.include_extra = include_extra
         self.annots_dir = self.data_dir / "annots_arrs"
@@ -446,6 +534,7 @@ class PreprocessEMOTIC(PreprocessDataset):
 
             pixel_str = None
             bbox = (row["X_min"], row["Y_min"], row["X_max"], row["Y_max"])
+            group_id = str(row["Filename"]) if "Filename" in row and pd.notna(row["Filename"]) else None
 
             # Strategy 1: Pre-cropped numpy array
             if "Crop_name" in row and pd.notna(row["Crop_name"]):
@@ -482,6 +571,7 @@ class PreprocessEMOTIC(PreprocessDataset):
             if pixel_str is not None:
                 samples.append(
                     VADSample(
+                        group_id=group_id,
                         name=f"{row['Filename']}_{idx}",
                         valence=float(v_val),
                         arousal=float(a_val),
@@ -508,6 +598,7 @@ class PreprocessHECO(PreprocessDataset):
         margin: float = 0.15,
         seed: int = 42,
         target_age: Optional[str] = None,
+        resplit: bool = True
     ):
         super().__init__(
             "heco",
@@ -518,7 +609,8 @@ class PreprocessHECO(PreprocessDataset):
             min_confidence=min_confidence,
             margin=margin,
             seed=seed,
-            target_age=target_age
+            target_age=target_age,
+            resplit=resplit
         )
         self.images_dir = self.data_dir / "Data"
         self.labels_file = self.data_dir / "Labels" / "HECO_Labels.csv"
@@ -606,13 +698,20 @@ def main():
     parser.add_argument("--image_size", type=int, default=112, help="Output image size (width & height)")
     parser.add_argument("--target_age", type=str, default=None, choices=["child", "adult"], help="Filter samples by target age group")
     parser.add_argument("--include_extra", action="store_true", help="Include EMOTIC extra training data")
+    parser.add_argument("--no_resplit", action="store_true", help="Disable forced-resplitting of dataset and retain original splits if available")
     args = parser.parse_args()
 
     size = (args.image_size, args.image_size)
 
     if args.dataset in ["afew", "all"]:
         afew_dir = args.data_dir if args.data_dir else "../Data/VA/AFEW-VA"
-        afew_processor = PreprocessAFEW(data_dir=afew_dir, output_dir=args.output_dir, target_size=size, target_age=args.target_age)
+        afew_processor = PreprocessAFEW(
+            data_dir=afew_dir, 
+            output_dir=args.output_dir, 
+            target_size=size, 
+            target_age=args.target_age, 
+            resplit=not args.no_resplit
+        )
         afew_processor.process()
 
     if args.dataset in ["emotic", "all"]:
@@ -622,14 +721,21 @@ def main():
             output_dir=args.output_dir, 
             target_size=size, 
             target_age=args.target_age,
-            include_extra=args.include_extra
+            include_extra=args.include_extra,
+            resplit=not args.no_resplit
         )
         emotic_processor.process()
 
 
     if args.dataset in ["heco", "all"]:
             heco_dir = args.data_dir if args.data_dir else "../Data/VAD/HECO"
-            heco_processor = PreprocessHECO(data_dir=heco_dir, output_dir=args.output_dir, target_size=size, target_age=args.target_age)
+            heco_processor = PreprocessHECO(
+                data_dir=heco_dir, 
+                output_dir=args.output_dir, 
+                target_size=size, 
+                target_age=args.target_age,
+                resplit=not args.no_resplit
+            )
             heco_processor.process()
 
         
