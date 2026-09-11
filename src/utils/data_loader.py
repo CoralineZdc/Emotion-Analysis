@@ -36,7 +36,7 @@ class DataLoader(data.Dataset):
 
     data_protocol: str = "small_split"
     split_file_overrides: dict[str, str] = {}
-    size: int = 48  # Image dimensions
+    size: int = 224 # Image dimensions
     num_channels: int = 3  # Number of image channels (1 for pretrained models, 3 for training from scratch)
 
     @classmethod
@@ -55,6 +55,13 @@ class DataLoader(data.Dataset):
         if num_channels not in {1, 3}:
             raise ValueError(f"num_channels must be 1 or 3, got {num_channels}")
         cls.num_channels = num_channels
+
+    @classmethod
+    def set_image_size(cls, size: int):
+        """Set the image size for loading (assumes square images)."""
+        if size <= 0:
+            raise ValueError(f"Image size must be positive, got {size}")
+        cls.size = size
 
     @classmethod
     def _get_split_candidates(cls, split: str, dataset: str = "fer") -> List[str]:

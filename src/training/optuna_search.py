@@ -184,7 +184,7 @@ def main():
     parser.add_argument("--range_weight_decay", type=parse_csv_floats, default="1e-6, 1e-2", help="Min, Max bounds for weight decay")
     parser.add_argument("--range_backbone_lr_scale", type=parse_csv_floats, default="1e-3, 1.0", help="Min, Max for backbone LR scaling")
     parser.add_argument("--range_unfreeze_epoch", type=parse_csv_ints, default="0, 15", help="Min, Max unfreeze epoch bounds")
-    parser.add_argument("--range_input_size", type=parse_csv_ints, default="48, 112", help="Discrete input resolutions")
+    parser.add_argument("--range_input_size", type=parse_csv_ints, default="112, 224", help="Discrete input resolutions")
     parser.add_argument("--range_batch_size", type=parse_csv_ints, default="16, 32, 64", help="Discrete batch sizes")
     parser.add_argument("--range_dropout_rate", type=parse_csv_floats, default="0.1, 0.6, 0.1", help="Min, Max, Step for dropout")
     parser.add_argument("--range_weights_source", type=parse_csv_strings, default="imagenet, custom", help="Weights source options")
