@@ -37,6 +37,26 @@ Options:
   --no_resplit          Disable forced-resplitting of dataset and retain original splits if available
 ```
 
+### Visualize dataset VAD distribution
+
+Visualize Valece, Arousal and eventually Dominance isolated and pairwise distribution across splits.
+
+```bash
+python -m src.data.visualize_vad
+```
+
+Options:
+
+```bash
+  -h, --help            show this help message and exit
+  --data_dir DATA_DIR   Directory containing split CSVs
+  --dataset {afew,emotic,heco}
+                        Dataset to visualize
+  --target_age {child,adult}
+                        Age suffix filter if applicable
+  --save_dir SAVE_DIR   Directory to save generated plot images
+```
+
 ### Train a single model
 
 Pipeline for training models from /models on datasets in /data.
