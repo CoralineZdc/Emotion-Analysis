@@ -53,7 +53,7 @@ def build_experiment_tag(opt: argparse.Namespace, explicit_args: List[str]) -> s
                 parts.append(f"not{key}")
         elif val is not None:
             # Sanitize path-breaking characters if present
-            clean_val = str(val).replace(" ", "-").replace("/", "-")
+            clean_val = str(val).replace(" ", "").replace("/", "").replace("_", "").replace("\\", "")
             parts.append(f"{key}-{clean_val}")
 
     return f"_{'_'.join(parts)}" if parts else ""

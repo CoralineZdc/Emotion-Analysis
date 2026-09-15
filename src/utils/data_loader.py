@@ -36,7 +36,7 @@ class DataLoader(data.Dataset):
 
     data_protocol: str = "small_split"
     split_file_overrides: dict[str, str] = {}
-    size: int = 224 # Image dimensions
+    size: int = 224 # Dynamic image dimensions fallback
     num_channels: int = 3  # Number of image channels (1 for pretrained models, 3 for training from scratch)
 
     @classmethod
@@ -138,6 +138,7 @@ class DataLoader(data.Dataset):
         train_path = cls._resolve_data_file(cls._get_split_candidates("Train", dataset))
         train_df = pd.read_csv(train_path)
         pixels = []
+        detected_sizes = []
 
         pixels_length = len(train_df["pixels"][0].split())
         cls.size = int(np.sqrt(pixels_length))
@@ -147,10 +148,20 @@ class DataLoader(data.Dataset):
                 continue
             try:
                 values = np.fromstring(pixel_str, dtype=np.float32, sep=" ")
-                if len(values) == pixels_length:
+                pixel_count = len(values)
+                side = int(np.sqrt(pixel_count))
+                if side * side == pixel_count and pixel_count > 0:
                     pixels.append(values / 255.0)
+                    detected_sizes.append(side)
             except ValueError:
                 continue
+
+        if detected_sizes:
+            unique_sizes = set(detected_sizes)
+            if len(unique_sizes) > 1:
+                print(f"[Image Warning] Detected multiple image sizes in dataset '{dataset}': {unique_sizes}. Using size {cls.size}.")
+            else:
+                cls.size = unique_sizes.pop()
 
         if not pixels:
             cls.image_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
@@ -242,7 +253,7 @@ class DataLoader(data.Dataset):
                 dropped_invalid += 1
                 continue
 
-            if len(pixels) != expected_length:
+            if len(pixels) != expected_length or len(pixels) == 0:
                 dropped_invalid += 1
                 continue
 
