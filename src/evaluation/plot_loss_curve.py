@@ -14,25 +14,35 @@ from src.utils.parsing_utils import repo_root
 
 
 def format_title_from_folder(folder_name: str) -> str:
-    """Format experiment folder name into a readable plot title."""
-    simu_params_list = folder_name.split("_")
-    for id_param, simu_param in enumerate(simu_params_list):
-        simu_param = simu_param.strip()
-        simu_param = simu_param.replace("-", "=")
-        for id_letter, letter in enumerate(simu_param):
-            if letter.isdigit():
-                simu_params_list[id_param] = simu_param[:id_letter] + "=" + simu_param[id_letter:]
-                break
+    """Dynamically format experiment folder name into a multi-line plot title."""
+    tokens = folder_name.split("_")
+    formatted_params = []
 
-    if len(simu_params_list) % 6 != 0:
-        for _ in range(6 - len(simu_params_list) % 6):
-            simu_params_list.append("")
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            key, val = token.split("-", 1)
+            formatted_params.append(f"{key}={val}")
+        elif "=" in token:
+            formatted_params.append(token)
+        else:
+            # Fallback for old hyphenless parameters
+            idx = next((i for i, c in enumerate(token) if c.isdigit()), len(token))
+            key, val = token[:idx], token[idx:]
+            if key and val:
+                formatted_params.append(f"{key}={val}")
+            else:
+                formatted_params.append(token)
 
-    simu_params_str = ""
-    for i in range(len(simu_params_list) // 6):
-        simu_params_str += ", ".join(simu_params_list[6 * i : 6 * i + 6]).strip(", ") + "\n"
-
-    return simu_params_str.strip()
+    # Wrap parameters evenly across lines (5 items per line)
+    chunk_size = 5
+    lines = [
+        ", ".join(formatted_params[i : i + chunk_size])
+        for i in range(0, len(formatted_params), chunk_size)
+    ]
+    return "\n".join(lines)
 
 
 def plot_loss_curve(csv_path: Path) -> Path:

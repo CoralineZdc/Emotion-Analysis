@@ -198,19 +198,19 @@ Options:
                         Gradient clipping value (default: 0.0, no clipping)
                         Factor by which the learning rate will be reduced (default: 0.1)
   --range_learning_rate RANGE_LEARNING_RATE
-                        Min, Max bounds for LR
+                        'Min, Max' bounds for LR
   --range_weight_decay RANGE_WEIGHT_DECAY
-                        Min, Max bounds for weight decay
+                        'Min, Max' bounds for weight decay
   --range_backbone_lr_scale RANGE_BACKBONE_LR_SCALE
-                        Min, Max for backbone LR scaling
+                        'Min, Max' bounds for backbone LR scaling
   --range_unfreeze_epoch RANGE_UNFREEZE_EPOCH
-                        Min, Max unfreeze epoch bounds
+                        'Min, Max' bounds for unfreeze epoch
   --range_input_size RANGE_INPUT_SIZE
                         Discrete input resolutions
   --range_batch_size RANGE_BATCH_SIZE
                         Discrete batch sizes
   --range_dropout_rate RANGE_DROPOUT_RATE
-                        Min, Max, Step for dropout
+                        'Min, Max, Step' for dropout
   --range_weights_source RANGE_WEIGHTS_SOURCE
                         Weights source options
   --range_optimizer RANGE_OPTIMIZER
@@ -218,12 +218,13 @@ Options:
   --range_criterion RANGE_CRITERION
                         Criterions to search over
   --range_ccc_weight RANGE_CCC_WEIGHT
-                        Min, Max, Step for CCC loss weight
+                        'Min, Max, Step' for CCC loss weight
   --range_orth_loss_weight RANGE_ORTH_LOSS_WEIGHT
-                        Min, Max, Step for Orth loss weight
+                        'Min, Max, Step' for orth loss weight
   --range_lr_factor RANGE_LR_FACTOR
                         Discrete learning rate decay factors
   --range_lr_patience RANGE_LR_PATIENCE
+                        'Min, Max' bounds for scheduler patience
 ```
 
 ### Analyze HPO results

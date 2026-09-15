@@ -131,13 +131,31 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
         print(f"Starting training {opt.model} on {opt.dataset} dataset ({num_outputs} outputs)")
         print(f"Using device: {device} | Batch Size: {opt.batch_size} | Epochs: {opt.epochs}")
 
-        aug_str = "_dataaug" if opt.data_augmentation else ""
-        ccc_str = f"_CCCweight{opt.ccc_weight:.2f}" if opt.criterion == "combined" else ""
+        # Uniform key-val folder naming schema
+        ccc_str = f"_cccweight-{opt.ccc_weight:.2f}" if opt.criterion == "combined" else ""
+        orth_str = f"_orthweight-{opt.orth_loss_weight:.2f}" if opt.orth_loss_weight > 0 else ""
+        freeze_str = f"_unfreeze-{opt.unfreeze_epoch}" if opt.freezed else "_freezed-False"
+
         folder_name = (
-            f"{opt.model}/seed{opt.seed}_dataset-{opt.dataset}{aug_str}_modelweights-{opt.weights_source}_criterion-{opt.criterion}{ccc_str}"
-            f"_V{opt.VAD_weights[0]:.1f}_A{opt.VAD_weights[1]:.1f}_D{opt.VAD_weights[2]:.1f}"
-            f"_opt-{opt.optimizer}_lr{opt.learning_rate:.5f}_backboneLRscale{opt.backbone_lr_scale:.2f}"
-            f"_bs{opt.batch_size}_dropout{opt.dropout_rate:.1f}"
+            f"{opt.model}/"
+            f"seed-{opt.seed}_"
+            f"dataset-{opt.dataset}_"
+            f"size-{opt.input_size}_"
+            f"weights-{opt.weights_source}_"
+            f"{freeze_str.lstrip('_')}_"
+            f"criterion-{opt.criterion}"
+            f"{ccc_str}"
+            f"{orth_str}_"
+            f"V-{opt.VAD_weights[0]:.2f}_"
+            f"A-{opt.VAD_weights[1]:.2f}_"
+            f"D-{opt.VAD_weights[2]:.2f}_"
+            f"opt-{opt.optimizer}_"
+            f"lr-{opt.learning_rate:.5f}_"
+            f"backbonelr-{opt.backbone_lr_scale:.2f}_"
+            f"decay-{opt.weight_decay:.1e}_"
+            f"bs-{opt.batch_size}_"
+            f"dropout-{opt.dropout_rate:.2f}_"
+            f"aug-{opt.data_augmentation}"
         )
         path = os.path.join(opt.output_dir, folder_name)
         os.makedirs(path, exist_ok=True)

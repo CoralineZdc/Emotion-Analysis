@@ -83,7 +83,6 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="VAD Evaluation (MSE & RMSE per dimension).")
-    parser.add_argument("--input_size", type=int, default=48, help="Image spatial resolution (default: 48).")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"], help="Device to use for evaluation (default: cuda if available, otherwise cpu).")
     parser.add_argument("--split", type=str, default="Test", choices=["Test", "Val", "Train"], help="Data split to evaluate on (default: Test).")
     parser.add_argument("--state_dict_path", type=str, required=True, help="Path to state dict with weights (.pth).")
@@ -100,6 +99,7 @@ def main():
     dropout_rate = float(simu_params.get("dropout", 0.5))
     batch_size = int(simu_params.get("batch", 64))
     modelweights = simu_params.get("modelweights", None)
+    input_size = int(simu_params.get("input", 112))
 
     model_name = state_dict_path.parts[-3] if len(state_dict_path.parts) >=3 else "resnet50"  # Assuming the model name is the third last part of the path
 
@@ -149,7 +149,7 @@ def main():
 
     # Evaluation transforms and loader
     test_transform = Compose([
-        Resize((args.input_size, args.input_size)),
+        Resize((input_size, input_size)),
         ToImage(),
         ToDtype(torch.float32, scale=True),
         Normalize(mean=image_mean.tolist(), std=image_std.tolist())
