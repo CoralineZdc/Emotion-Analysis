@@ -40,6 +40,7 @@ def train(
     dataloader: torch.utils.data.DataLoader,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
     weights: torch.Tensor,
     device: torch.device,
     opt: argparse.Namespace,
@@ -50,6 +51,7 @@ def train(
     total_loss = 0.0
     all_preds, all_targets = [], []
     num_batches = len(dataloader)
+    use_amp = opt.use_amp and device.type == "cuda" 
 
     # Suppress verbose batch progress printing during Optuna sweeps
     is_optuna = trial is not None
@@ -77,16 +79,23 @@ def train(
         if loss.ndim > 0:
             loss = loss.mean()
 
-        loss.backward()
-
-        if opt.grad_clip > 0.0:
-            clip_gradient(optimizer, opt.grad_clip)
-
-        optimizer.step()
+        # Scaled backward pass prevents underflow
+        if use_amp:
+            scaler.scale(loss).backward()
+            if opt.grad_clip > 0.0:
+                scaler.unscale_(optimizer)
+                clip_gradient(optimizer, opt.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if opt.grad_clip > 0.0:
+                clip_gradient(optimizer, opt.grad_clip)
+            optimizer.step()
 
         total_loss += batch_loss.item() # Only register main loss for logging
-        all_preds.append(outputs.detach().cpu()) 
-        all_targets.append(targets.detach().cpu())
+        all_preds.append(outputs.detach().cpu().float()) 
+        all_targets.append(targets.detach().cpu().float())
 
         if not is_optuna:
             progress = (batch_idx + 1) / num_batches
@@ -175,6 +184,9 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
 
     model.to(device)
 
+    # AMP Scaler for Mixed Precision Training
+    scaler = torch.amp.GradScaler("cuda", enabled=opt.use_amp and device.type == "cuda")
+
     # Target label statistics and image statistics
     DataLoader.set_data_protocol("small_split")
     DataLoader.set_num_channels(num_channels)
@@ -259,7 +271,7 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     elif opt.optimizer == "adamw":
         optimizer = torch.optim.AdamW(param_groups)
     elif opt.optimizer == "sgd":
-        optimizer = torch.optim.SGD(param_groups, momentum=0.9)
+        optimizer = torch.optim.SGD(param_groups)
     else:
         raise ValueError(f"Unsupported optimizer: {opt.optimizer}")
 
@@ -293,8 +305,9 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
             for name, param in model.named_parameters():
                 param.requires_grad = True
 
-        train_loss, train_rmse = train(epoch, trainloader, model, optimizer, weights_tensor, device, opt, trial)
-        val_loss, val_rmse = evaluate(valloader, model, opt.criterion, alpha=opt.ccc_weight, weights=weights_tensor, device=device, trial=trial)
+        with torch.amp.autocast(device_type="cuda", enabled=opt.use_amp and device.type == "cuda"):
+            train_loss, train_rmse = train(epoch, trainloader, model, optimizer, scaler, weights_tensor, device, opt, trial)
+            val_loss, val_rmse = evaluate(valloader, model, opt.criterion, alpha=opt.ccc_weight, weights=weights_tensor, device=device, trial=trial)
         val_loss_float = float(val_loss.item()) if hasattr(val_loss, "item") else float(val_loss)
 
         if not is_optuna:
@@ -351,6 +364,7 @@ def build_parser():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"], help="Device to use for training (default: cuda if available, otherwise cpu)")
     parser.add_argument("--grad_clip", type=float, default=0.0, help="Gradient clipping value (default: 0.0, no clipping)")
     parser.add_argument("--data_augmentation", action="store_true", help="Apply data augmentation during training (default: False)")
+    parser.add_argument("--use_amp", action="store_true", default=True, help="Use Automatic Mixed Precision (AMP) training (default: True)")
     parser.add_argument("--resume", action="store_true", help="Resume training from a previous checkpoint (default: False)")
     parser.add_argument("--no_checkpoint", action="store_true", help="Do not save checkpoints (default: False)")
     parser.add_argument("--no_model_save", action="store_true", help="Do not save the model (default: False)")

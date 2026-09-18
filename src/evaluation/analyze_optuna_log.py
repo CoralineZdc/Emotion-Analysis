@@ -1,6 +1,8 @@
 import argparse
 import ast
 from pathlib import Path
+import re
+from io import StringIO
 import sys
 import pandas as pd
 import numpy as np
@@ -94,22 +96,37 @@ def parse_and_normalize_vad(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_and_clean_data(csv_path: Path) -> pd.DataFrame:
-    """Loads CSV log, extracts normalized VAD weights, merges individual VAD RMSEs into 'rmse_VAD', and coerces numeric types."""
-    df = pd.read_csv(csv_path)
+    """Loads CSV log with automatic repair for unquoted bracketed lists and inconsistent field counts."""
+    try:
+        df = pd.read_csv(csv_path)
+    except (pd.errors.ParserError, Exception):
+        # Fallback: Auto-quote unquoted list structures like [1.0, 1.0, 0.0] causing extra field splits
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                raw_lines = f.readlines()
+
+            sanitized_lines = []
+            for line in raw_lines:
+                fixed = re.sub(r'(?<!")(\[[^\]]+\])(?!")', r'"\1"', line)
+                sanitized_lines.append(fixed)
+
+            df = pd.read_csv(
+                StringIO("".join(sanitized_lines)),
+                engine="python",
+                on_bad_lines="skip"
+            )
+            print(f"Notice: Auto-repaired CSV formatting issues (unquoted lists/commas) in '{csv_path.name}'.")
+        except Exception:
+            df = pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
+            print(f"Warning: Skipped malformed lines in '{csv_path.name}' due to CSV parsing errors.")
+
     df = parse_and_normalize_vad(df)
 
-    numeric_candidates = [
-        "mean_rmse", "val_loss", "duration_sec", "batch_size", "orth_loss_weight", "ccc_weight",
-        "learning_rate", "weight_decay", "backbone_lr_scale", "dropout_rate",
-        "unfreeze_epoch", "lr_factor", "lr_patience", "input_size",
-        "rmse_Valence", "rmse_Arousal", "rmse_Dominance"
-    ]
-    
+    categorical_cols_set = {"status", "VAD_weights_normalized", "criterion", "optimizer", "weights_source", "rmse_VAD"}
     for col in df.columns:
-        if col in numeric_candidates or any(k in col.lower() for k in ["loss", "lr", "rate", "epoch", "size", "batch"]):
+        if col not in categorical_cols_set and not col.startswith("_vad_"):
             df[col] = pd.to_numeric(df[col], errors="ignore")
 
-    # Combine individual Valence/Arousal/Dominance RMSEs into a concise single column: "V; A; D"
     vad_rmse_cols = ["rmse_Valence", "rmse_Arousal", "rmse_Dominance"]
     if all(c in df.columns for c in vad_rmse_cols):
         df["rmse_VAD"] = df.apply(
@@ -140,17 +157,21 @@ def get_parameter_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     cat_cols = []
     num_cols = []
 
+    eval_df = df[df["status"].isin(["COMPLETE", "PRUNED"])] if "status" in df.columns else df
+
     for col in df.columns:
         if col in exclude or col.startswith("_vad_") or col.startswith("VAD_w_normalized"):
             continue
 
-        if col in target_categoricals and df[col].nunique() > 1:
+        valid_series = eval_df[col].dropna()
+        if valid_series.nunique() <= 1:
+            continue
+
+        if col in target_categoricals:
             cat_cols.append(col)
-        elif col in target_numerics and df[col].nunique() > 1:
+        elif col in target_numerics or pd.api.types.is_numeric_dtype(df[col]):
             num_cols.append(col)
-        elif pd.api.types.is_numeric_dtype(df[col]) and df[col].nunique() > 1:
-            num_cols.append(col)
-        elif not pd.api.types.is_numeric_dtype(df[col]) and df[col].nunique() > 1:
+        else:
             cat_cols.append(col)
 
     return sorted(list(set(cat_cols))), sorted(list(set(num_cols)))
@@ -158,9 +179,14 @@ def get_parameter_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
 
 def format_num(val):
     """Utility helper for consistent number formatting in output tables."""
-    if pd.isna(val):
+    if pd.isna(val) or val == "N/A":
         return "N/A"
-    if isinstance(val, (int, np.integer)) or (isinstance(val, float) and val.is_integer()):
+    try:
+        val = float(val)
+    except (ValueError, TypeError):
+        return str(val)
+
+    if val.is_integer():
         return f"{int(val)}"
     if abs(val) < 0.001 or abs(val) > 1000:
         return f"{val:.2e}"
@@ -178,6 +204,78 @@ def format_time(seconds: float) -> str:
         return f"{int(m)}m {int(s)}s ({seconds:.1f}s)"
     h, m = divmod(m, 60)
     return f"{int(h)}h {int(m)}m ({seconds:.1f}s)"
+
+
+def extract_filename_params(csv_path: str) -> dict:
+    """Extracts fixed hyperparameters encoded in the CSV log filename tag."""
+    filename = Path(csv_path).name.replace("_trials.csv", "")
+    params = {}
+
+    boolean_flags = {
+        "pretrained", "freezed", "data_augmentation", "use_amp", 
+        "resume", "no_checkpoint", "no_model_save"
+    }
+
+    value_keys = [
+        "seed", "dataset", "input_size", "num_workers", "early_stopping_patience", 
+        "output_dir", "batch_size", "epochs", "learning_rate", "backbone_lr_scale", 
+        "unfreeze_epoch", "weight_decay", "model", "weights_source", "dropout_rate", 
+        "optimizer", "device", "grad_clip", "criterion", "VAD_weights", 
+        "orth_loss_weight", "ccc_weight", "lr_factor", "lr_patience", 
+        "lr_threshold", "lr_threshold_mode", "lr_cooldown", "lr_min"
+    ]
+
+    for key in value_keys:
+        match = re.search(rf"(?:^|_){key}-([^_]+)", filename)
+        if match:
+            val = match.group(1).replace("[", "\"").replace("]", "\"")
+            params[key] = val
+
+    for flag in boolean_flags:
+        if re.search(rf"(?:^|_){flag}(?:_|$)", filename):
+            params[flag] = True
+        elif re.search(rf"(?:^|_)not{flag}(?:_|$)", filename):
+            params[flag] = False
+
+    return params
+
+
+def generate_best_run_command(csv_path: str, best_row: pd.Series) -> str:
+    """Constructs the exact executable CLI command for the best trial."""
+    cmd_args = ["python", "-m", "src.training.train"]
+    params = extract_filename_params(csv_path)
+    
+    known_args = [
+        "dataset", "model", "input_size", "batch_size", "learning_rate", 
+        "backbone_lr_scale", "unfreeze_epoch", "weight_decay", "weights_source", 
+        "dropout_rate", "optimizer", "criterion", "ccc_weight", 
+        "VAD_weights", "orth_loss_weight", "ccc_weight", "lr_factor", "lr_patience",
+        "lr_threshold", "lr_cooldown", "lr_min", "data_augmentation", 
+        "pretrained", "freezed", "data_augmentation",
+    ]
+    
+    for arg in known_args:
+        if arg in best_row and pd.notna(best_row[arg]) and best_row[arg] != "N/A":
+            params[arg] = best_row[arg]
+
+
+    if "VAD_weights_normalized" in best_row and pd.notna(best_row["VAD_weights_normalized"]) and best_row["VAD_weights_normalized"] != "N/A":
+        raw_vad = str(best_row["VAD_weights_normalized"]).strip("[]").replace(" ", "")
+        params["VAD_weights"] = f'"{raw_vad}"'
+
+    boolean_flags = {
+        "pretrained", "freezed", "data_augmentation", "use_amp", 
+        "resume", "no_checkpoint", "no_model_save"
+    }
+
+    for k, v in params.items():
+        if k in boolean_flags:
+            if v is True or str(v).lower() == "true":
+                cmd_args.append(f"--{k}")
+        else:
+            cmd_args.append(f"--{k} {v}")
+
+    return " ".join(cmd_args)
 
 
 def run_joint_vad_analysis(df: pd.DataFrame):
@@ -233,8 +331,7 @@ def run_joint_vad_analysis(df: pd.DataFrame):
                 perm_f.append(compute_f_stat(dist_matrix, g1_p, g2_p))
 
             p_val = (np.sum(np.array(perm_f) >= obs_f) + 1) / (n_perm + 1)
-            sig = "***" if p_val <= 0.01 else ("**" if p_val <= 0.05 else ("*" if p_val <= 0.1 else "ns"))
-            print(f"PERMANOVA Joint Normalized VAD Prune Risk Test p-value : {p_val:.4f} [{sig}]")
+            print(f"PERMANOVA Joint Normalized VAD Prune Risk Test p-value : {p_val:.4f}")
 
 
 def print_categorical_table(df: pd.DataFrame, cat_cols: list):
@@ -275,7 +372,10 @@ def print_categorical_table(df: pd.DataFrame, cat_cols: list):
 
 
 def run_prune_propensity_test(df: pd.DataFrame, cat_cols: list, num_cols: list):
-    """Identifies which parameter values directly trigger trial pruning."""
+    """Identifies which parameter values trigger trial pruning."""
+    if not cat_cols and not num_cols:
+        return
+
     print("\n[ PRUNE PROPENSITY ANALYSIS (Parameters Triggering Pruning) ]")
     
     eval_df = df[df["status"].isin(["COMPLETE", "PRUNED"])].copy()
@@ -287,34 +387,37 @@ def run_prune_propensity_test(df: pd.DataFrame, cat_cols: list, num_cols: list):
     results = []
 
     for col in cat_cols:
-        if col in eval_df.columns and eval_df[col].nunique() > 1:
-            contingency = pd.crosstab(eval_df[col], eval_df["is_pruned"])
-            if contingency.shape[0] > 1 and contingency.shape[1] > 1:
-                _, p_val, _, _ = stats.chi2_contingency(contingency)
-                
-                prune_rates = eval_df.groupby(col)["is_pruned"].mean()
-                worst_cat = prune_rates.idxmax()
-                highest_rate = prune_rates.max() * 100
+        if col in eval_df.columns:
+            sub_df = eval_df.dropna(subset=[col])
+            if sub_df[col].nunique() > 1 and sub_df["is_pruned"].nunique() > 1:
+                contingency = pd.crosstab(sub_df[col], sub_df["is_pruned"])
+                if contingency.shape[0] > 1 and contingency.shape[1] > 1:
+                    _, p_val, _, _ = stats.chi2_contingency(contingency)
+                    
+                    prune_rates = sub_df.groupby(col)["is_pruned"].mean()
+                    worst_cat = prune_rates.idxmax()
+                    highest_rate = prune_rates.max() * 100
 
-                results.append({
-                    "Parameter": col,
-                    "Type": "Categorical",
-                    "Prune Test": "Chi-Square",
-                    "p-value": p_val,
-                    "Prune Trigger Risk": f"Value '{worst_cat}' ({highest_rate:.0f}% pruned)"
-                })
+                    results.append({
+                        "Parameter": col,
+                        "Type": "Categorical",
+                        "Prune Test": "Chi-Square",
+                        "p-value": p_val,
+                        "Prune Trigger Risk": f"Value '{worst_cat}' ({highest_rate:.0f}% pruned)"
+                    })
 
     for col in num_cols:
-        if col in eval_df.columns and eval_df[col].nunique() > 1:
-            pruned_vals = eval_df[eval_df["is_pruned"] == 1][col].dropna()
-            completed_vals = eval_df[eval_df["is_pruned"] == 0][col].dropna()
+        if col in eval_df.columns:
+            sub_df = eval_df.dropna(subset=[col])
+            pruned_vals = sub_df[sub_df["is_pruned"] == 1][col]
+            completed_vals = sub_df[sub_df["is_pruned"] == 0][col]
 
-            if len(pruned_vals) > 1 and len(completed_vals) > 1:
-                _, p_val = stats.mannwhitneyu(pruned_vals, completed_vals)
+            if len(pruned_vals) >= 1 and len(completed_vals) >= 1 and sub_df[col].nunique() > 1:
+                _, p_val = stats.mannwhitneyu(pruned_vals, completed_vals, alternative="two-sided")
                 
                 med_pruned = pruned_vals.median()
                 med_comp = completed_vals.median()
-                direction = "High values" if med_pruned > med_comp else "Low values"
+                direction = "High values" if med_pruned > med_comp else ("Low values" if med_pruned < med_comp else "Equal median")
 
                 results.append({
                     "Parameter": col,
@@ -474,33 +577,40 @@ def analyze_trials(csv_path: Path, top_k: int = 5, save: bool = False, output_di
             print("\nNo completed trials found in log. Exiting analysis.")
             return
 
-        # Print Top N Configurations
+        if not completed_df.empty:
+            best_row = completed_df.loc[completed_df["mean_rmse"].idxmin()]
+            best_cmd = generate_best_run_command(csv_path, best_row)
+            
+            print(f"\n[ BEST TRIAL COMMAND LINE ]\n{best_cmd}")
+        
+
         print(f"\n[ TOP {top_k} BEST CONFIGURATIONS ]")
         top_trials = completed_df.sort_values(by="mean_rmse", ascending=True).head(top_k)
         
-        candidate_cols = [
-            "trial_num", "mean_rmse", "val_loss", "rmse_VAD",
-            "criterion", "optimizer", "batch_size", "learning_rate",
-            "weight_decay", "dropout_rate", "orth_loss_weight", "ccc_weight", "backbone_lr_scale",
-            "VAD_weights_normalized"
-        ]
-        display_cols = [c for c in candidate_cols if c in top_trials.columns]
+        meta_cols = ["trial_num", "mean_rmse", "val_loss", "rmse_VAD", "duration_sec"]
+        meta_present = [c for c in meta_cols if c in top_trials.columns]
+        
+        exclude_internal = {
+            "trial_num", "status", "mean_rmse", "val_loss", "duration_sec", "rmse_VAD",
+            "rmse_Valence", "rmse_Arousal", "rmse_Dominance",
+            "_vad_pV", "_vad_pA", "_vad_pD"
+        }
+        hp_present = [c for c in top_trials.columns if c not in exclude_internal]
+        
+        display_cols = meta_present + hp_present
         
         pd.set_option("display.max_columns", None)
         pd.set_option("display.width", 1000)
         pd.set_option("display.max_colwidth", None)
         print(top_trials[display_cols].to_string(index=False))
 
-        # Identify clean parameter lists for statistical tables
         cat_cols, num_cols = get_parameter_lists(df)
 
         print_categorical_table(df, cat_cols)
         run_statistical_importance_test(df, cat_cols, num_cols)
         run_prune_propensity_test(df, cat_cols, num_cols)
-        run_joint_vad_analysis(df)
-
-        if save and tee:
-            print(f"\n[ REPORT SAVED ]\nAnalysis log written to: {output_dir / f'{csv_path.stem}_analysis.txt'}")
+        if "_vad_pV" in df.columns and "_vad_pA" in df.columns and "_vad_pD" in df.columns:
+            run_joint_vad_analysis(df)
 
     finally:
         if tee:

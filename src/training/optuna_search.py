@@ -5,6 +5,11 @@ import csv
 import os
 import time
 from typing import Any, List
+import gc
+
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"  # Suppress C++ CUDACachingAllocator warning logs
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"  # Prevent memory thrashing warnings
+
 import torch
 
 import optuna
@@ -14,8 +19,6 @@ from optuna.samplers import TPESampler
 from src.training.train import build_parser, run_training
 from src.utils.parsing_utils import parse_csv_floats, parse_csv_ints, parse_csv_strings, parse_csv_bool_tuples
 
-
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True" # Prevent CUDA OOM by allowing dynamic memory expansion
 
 # -------------------------------------------------------------------------
 # CLI & Dynamic Experiment Tagging Helpers
@@ -110,9 +113,10 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, explicit_
     # Disable disk I/O saving during optimization
     opt.no_checkpoint = True
     opt.no_model_save = True
+    opt.use_amp = True  # Enable AMP for faster trials
 
     # Categorical hyperparameters
-    categorical_params = ["weights_source", "input_size", "optimizer", "criterion", "lr_factor"]
+    categorical_params = ["model", "weights_source", "input_size", "optimizer", "criterion", "lr_factor"]
     for param in categorical_params:
         if param not in explicit_args:
             setattr(opt, param, sample_categorical(trial, param, getattr(opt, f"range_{param}")))
@@ -182,14 +186,16 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, explicit_
     status = "COMPLETE"
     best_val_loss = float("inf")
     best_rmse_per_dim = None
-    target_names = []
+    target_names = ["Valence", "Arousal"] if getattr(opt, "dataset", "").lower() == "afew" else ["Valence", "Arousal", "Dominance"]
     mean_rmse = float("inf")
 
     # ---------------------------------------------------------
     # 2. Training Execution & Metric Extraction
     # ---------------------------------------------------------
     try:
-        best_val_loss, best_rmse_per_dim, target_names = run_training(opt, trial=trial)
+        best_val_loss, best_rmse_per_dim, returned_targets = run_training(opt, trial=trial)
+        if returned_targets:
+            target_names = returned_targets
 
         if best_rmse_per_dim is not None and len(best_rmse_per_dim) > 0:
             rmse_floats = [float(r.item()) if hasattr(r, "item") else float(r) for r in best_rmse_per_dim]
@@ -220,31 +226,53 @@ def objective(trial: optuna.trial.Trial, base_opt: argparse.Namespace, explicit_
         # ---------------------------------------------------------
         file_exists = os.path.exists(log_csv_path)
 
-        fixed_param_keys = [
+        all_param_keys = [
             "weights_source", "unfreeze_epoch", "input_size", "learning_rate", 
             "weight_decay", "backbone_lr_scale", "optimizer", "batch_size", "dropout_rate", 
             "criterion", "ccc_weight", "orth_loss_weight", "lr_factor", "lr_patience"
         ]
 
+        active_param_keys = []
+        for param in all_param_keys:
+            if param in explicit_args:
+                continue
+            if param == "ccc_weight" and getattr(opt, "criterion", None) != "combined" and "criterion" in explicit_args:
+                continue
+            range_vals = getattr(opt, f"range_{param}", None)
+            if range_vals is not None and len(range_vals) <= 1:
+                continue
+            active_param_keys.append(param)
+
+        include_vad_weights = "VAD_weights" not in explicit_args
+
+        file_exists = os.path.exists(log_csv_path)
+
         with open(log_csv_path, "a", newline="") as f:
             writer = csv.writer(f)
 
-            rmse_header = [f"rmse_{name}" for name in target_names] if target_names else ["rmse_Valence", "rmse_Arousal", "rmse_Dominance"]
+            rmse_header = [f"rmse_{name}" for name in target_names]
             
             if not file_exists:
-                header = ["trial_num", "status", "mean_rmse", "val_loss"] + rmse_header + ["duration_sec"] + fixed_param_keys + ["VAD_weights_normalized"]
+                header = ["trial_num", "status", "mean_rmse", "val_loss"] + rmse_header + ["duration_sec"] + active_param_keys + ["VAD_weights_normalized"]
                 writer.writerow(header)
 
-            rmse_values = [trial.user_attrs.get(f"val_rmse_{name}", "N/A") for name in target_names] if target_names else ["N/A"] * 3
-            param_values = [trial.params.get(k, getattr(opt, k, "N/A")) for k in fixed_param_keys]
+            rmse_values = [trial.user_attrs.get(f"val_rmse_{name}", "N/A") for name in target_names]
+            param_values = [trial.params.get(k, getattr(opt, k, "N/A")) for k in active_param_keys]
             row = [
                 trial.number,
                 status,
                 round(mean_rmse, 4) if mean_rmse != float("inf") else "N/A",
                 round(best_val_loss, 4) if best_val_loss != float("inf") else "N/A",
-            ] + rmse_values + [elapsed_time] + param_values + [str(opt.VAD_weights)]
+            ] + rmse_values + [elapsed_time] + param_values 
+
+            if include_vad_weights:
+                row.append(getattr(opt, "VAD_weights", "N/A"))
             
             writer.writerow(row)
+
+        gc.collect()  # Explicitly free memory to prevent OOM in subsequent trials
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear GPU cache to prevent memory fragmentation
 
     return mean_rmse
 
@@ -261,6 +289,7 @@ def main():
     parser.add_argument("--resume_study", action="store_true", help="Resume an existing Optuna study if it exists")
 
     # Dynamic Range Arguments using custom parsing utils
+    parser.add_argument("--range_model", type=parse_csv_strings, default="vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,efficientnet,mobilenet,mobilefacenet", help="Backbone model options")
     parser.add_argument("--range_learning_rate", type=parse_csv_floats, default="1e-4, 1e-1", help="'Min, Max' bounds for LR")
     parser.add_argument("--range_weight_decay", type=parse_csv_floats, default="1e-6, 1e-2", help="'Min, Max' bounds for weight decay")
     parser.add_argument("--range_backbone_lr_scale", type=parse_csv_floats, default="1e-3, 1.0", help="'Min, Max' bounds for backbone LR scaling")
