@@ -5,36 +5,14 @@ import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Navigate UP 3 levels: evaluation -> src -> Project Root
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
 
-from src.utils.parsing_utils import repo_root
+from src.utils.parsing_utils import repo_root, get_simu_params
 
 
 def format_title_from_folder(folder_name: str) -> str:
     """Dynamically format experiment folder name into a multi-line plot title."""
-    tokens = folder_name.split("_")
-    formatted_params = []
-
-    for token in tokens:
-        token = token.strip()
-        if not token:
-            continue
-        if "-" in token:
-            key, val = token.split("-", 1)
-            formatted_params.append(f"{key}={val}")
-        elif "=" in token:
-            formatted_params.append(token)
-        else:
-            # Fallback for old hyphenless parameters
-            idx = next((i for i, c in enumerate(token) if c.isdigit()), len(token))
-            key, val = token[:idx], token[idx:]
-            if key and val:
-                formatted_params.append(f"{key}={val}")
-            else:
-                formatted_params.append(token)
+    params = get_simu_params(Path(folder_name))
+    formatted_params = [f"{key}={value}" for key, value in params.items()]
 
     # Wrap parameters evenly across lines (5 items per line)
     chunk_size = 5
@@ -52,41 +30,36 @@ def plot_loss_curve(csv_path: Path) -> Path:
     if "train_loss" not in df.columns or "val_loss" not in df.columns:
         raise ValueError(f"CSV file {csv_path} must contain 'train_loss' and 'val_loss' columns.")
 
-    plt.figure(figsize=(11, 7))
+    linestyles = {"train": "--", "val": "-"}
+    dim_colors = {"Valence": "green", "Arousal": "red", "Dominance": "blue"}
+
+    fig, axs = plt.subplots(3, 1, figsize=(11, 17), sharex=True)
 
     # Plot Overall Loss (Black)
-    plt.plot(df["epoch"], df["train_loss"], label="Train Loss", color="black", linestyle="--", alpha=0.8)
-    plt.plot(df["epoch"], df["val_loss"], label="Val Loss", color="black", linestyle="-", linewidth=2)
+    for split, linestyle in linestyles.items():
+        col_name = f"{split}_loss"
+        if col_name in df.columns:
+            axs[0].plot(df["epoch"], df[col_name], label=f"{split.capitalize()} Loss", color="black", linestyle=linestyle)
+            for idx, loss_type in enumerate(["rmse", "ccc"]):
+                for dim_name, color in dim_colors.items():
+                    col_name = f"{split}_{loss_type}_{dim_name}"
+                    if col_name in df.columns:
+                        axs[idx+1].plot(df["epoch"], df[col_name], label=f"{dim_name} {split.capitalize()} {loss_type.upper()}", color=color, linestyle=linestyle)
 
-    # Map Dimensions to Colors
-    dim_colors = [
-        ("Valence", "green"),
-        ("Arousal", "red"),
-        ("Dominance", "blue"),
-    ]
+    for idx, loss_type in enumerate(["Overall Loss", "RMSE", "CCC"]):
+        axs[idx].set_ylabel(loss_type)
+        axs[idx].set_xlabel("Epoch")
+        axs[idx].legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.0)
+        axs[idx].set_title(f"{loss_type}{' per Dimension' if idx > 0 else ''}", fontsize=12)
+        axs[idx].grid(True, linestyle="--", alpha=0.5)
 
-    # Plot Registered Dimension RMSEs
-    for dim_name, color in dim_colors:
-        train_col = f"{dim_name}_train_rmse"
-        val_col = f"{dim_name}_val_rmse"
-
-        if train_col in df.columns:
-            plt.plot(df["epoch"], df[train_col], label=f"{dim_name} Train RMSE", color=color, linestyle="--", alpha=0.7)
-        if val_col in df.columns:
-            plt.plot(df["epoch"], df[val_col], label=f"{dim_name} Val RMSE", color=color, linestyle="-", linewidth=1.8)
-
-    # Styling
     title_str = format_title_from_folder(csv_path.parent.name)
-    plt.title(title_str, fontsize=10)
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss / RMSE")
-    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.0)
-    plt.grid(True, linestyle=":", alpha=0.6)
-    plt.tight_layout()
+    fig.suptitle(title_str, fontsize=10)
+    fig.tight_layout()
 
     # Save to the specific experiment directory containing log.csv
     output_file = csv_path.parent / "loss_curve.png"
-    plt.savefig(output_file, dpi=300)
+    fig.savefig(output_file, dpi=300)
     plt.close()
 
     return output_file

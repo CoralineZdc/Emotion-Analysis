@@ -612,6 +612,7 @@ class PreprocessHECO(PreprocessDataset):
             target_age=target_age,
             resplit=resplit
         )
+        self.data_dir = self.data_dir / "HECO"
         self.images_dir = self.data_dir / "Data"
         self.labels_file = self.data_dir / "Labels" / "HECO_Labels.csv"
 

@@ -8,45 +8,24 @@ from pathlib import Path
 import optuna
 from torchvision.transforms.v2 import Compose, Resize, ToImage, ToDtype, Normalize
 
-
-# Navigate UP 3 levels: evaluation -> src -> Project Root
-project_root = Path(__file__).resolve().parents[2]
-if project_root not in sys.path:
-    sys.path.insert(0, str(project_root))
-
 from src.utils.data_loader import DataLoader
-from src.utils.training_utils import load_model, compute_batch_loss
+from src.utils.training_utils import load_model, compute_batch_loss, get_transforms, compute_metrics 
+from src.utils.parsing_utils import get_simu_params
 
 
 def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def get_simu_params(state_dict_path):
-    """Extracts simulation parameters from the directory name of the state_dict_path."""
-    dir_name = state_dict_path.parent.name
-    params = {}
-    for param in dir_name.split("_"):
-        if "-" in param:
-            key, value = param.split("-", 1)
-            params[key] = value
-        else:
-            idx = next((i for i, c in enumerate(param) if c.isdigit()), len(param))
-            key, value = param[:idx], param[idx:]
-            if key:
-                params[key] = value
-    return params
-
-
 def evaluate(
         dataloader: torch.utils.data.DataLoader, 
         model: torch.nn.Module, 
+        weights: torch.Tensor,
         criterion_type: str = "mse",
         alpha: float = 0.5,
-        weights: torch.Tensor | None = None,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), 
         trial: optuna.trial.Trial | None = None
-    ) -> tuple[float, np.ndarray]:
+    ) -> tuple[float, dict[str, float]]:
     model.eval()
     total_loss = 0.0
     all_preds, all_targets = [], []
@@ -73,12 +52,8 @@ def evaluate(
     print(" " * 80, end="\r") if not is_optuna else None  # Clear the progress bar line
 
     avg_loss = total_loss / max(total_batches, 1)
-
-    preds_cat = torch.cat(all_preds, dim=0)
-    targets_cat = torch.cat(all_targets, dim=0)
-    rmse_per_dim = torch.sqrt(torch.mean((preds_cat - targets_cat) ** 2, dim=0)).cpu().numpy()
-
-    return avg_loss, rmse_per_dim
+    metrics = compute_metrics(torch.cat(all_preds, dim=0), torch.cat(all_targets, dim=0))
+    return avg_loss, metrics
 
 
 def main():
@@ -97,9 +72,11 @@ def main():
     simu_params = get_simu_params(state_dict_path)
     dataset_name = simu_params.get("dataset", "fer")
     dropout_rate = float(simu_params.get("dropout", 0.5))
-    batch_size = int(simu_params.get("batch", 64))
-    modelweights = simu_params.get("modelweights", None)
-    input_size = int(simu_params.get("input", 112))
+    batch_size = int(simu_params.get("bs", 64))
+    modelweights = simu_params.get("weights", None)
+    input_size = int(simu_params.get("size", 112))
+    criterion = simu_params.get("criterion", "mse")
+    ccc_weight = float(simu_params.get("cccweight", 0.0))
 
     model_name = state_dict_path.parts[-3] if len(state_dict_path.parts) >=3 else "resnet50"  # Assuming the model name is the third last part of the path
 
@@ -144,39 +121,48 @@ def main():
         image_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device)
         image_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device)
     else:
-        image_mean = DataLoader.image_mean.to(device, dtype=torch.float32)
-        image_std = DataLoader.image_std.to(device, dtype=torch.float32)
+        image_mean = DataLoader.image_mean
+        image_std = DataLoader.image_std
+        if isinstance(image_mean, (torch.Tensor, np.ndarray)):
+            image_mean = image_mean.tolist()
+        if isinstance(image_std, (torch.Tensor, np.ndarray)):
+            image_std = image_std.tolist()
 
     # Evaluation transforms and loader
-    test_transform = Compose([
-        Resize((input_size, input_size)),
-        ToImage(),
-        ToDtype(torch.float32, scale=True),
-        Normalize(mean=image_mean.tolist(), std=image_std.tolist())
-    ])
+
+    _, test_transform = get_transforms(image_mean=image_mean, image_std=image_std, input_size=input_size)
 
     dataset = DataLoader(
-        split=args.split, 
         dataset=dataset_name, 
+        split=args.split, 
         transform=test_transform, 
         include_V=include_flags[0], 
         include_A=include_flags[1], 
         include_D=include_flags[2])
     test_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # Run evaluation
-    avg_loss, rmse_per_dim = evaluate(test_loader, model, weights=weights, device=device)
+    # Run evaluation using checkpoint loss criterion & alpha
+    avg_loss, metrics = evaluate(
+        test_loader, 
+        model, 
+        weights=weights, 
+        criterion_type=criterion, 
+        alpha=ccc_weight, 
+        device=device
+    )
 
     # Display results
     print(f"\n=== Evaluation Results on '{args.split}' ===")
     print(f"Average Loss: {avg_loss:.4f}\n")
-    dims = ["Valence (V)", "Arousal (A)", "Dominance (D)"]
-    dims = [dim for dim, include in zip(dims, include_flags) if include]
-    print(f"{'Dimension':<15} | {'RMSE':<10}")
-    print("-" * 28)
-    for idx, dim_name in enumerate(dims):
-        if idx < len(rmse_per_dim):
-            print(f"{dim_name:<15} | {rmse_per_dim[idx]:<10.4f}")
+
+    for metric, value in metrics.items():
+        if isinstance(value, (list, tuple, np.ndarray)):
+            formatted_val = ", ".join(f"{v:.4f}" for v in value)
+            print(f"{metric:<20} | [{formatted_val}]")
+        elif isinstance(value, (float, int)):
+            print(f"{metric:<20} | {value:<10.4f}")
+        else:
+            print(f"{metric:<20} | {str(value)}")
 
 
 if __name__ == "__main__":

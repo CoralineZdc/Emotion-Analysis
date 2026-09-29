@@ -4,7 +4,6 @@ import os
 import numpy as np
 import optuna
 import torch
-from torchvision.transforms import v2 as transforms
 
 from src.evaluation.test import evaluate
 from src.utils.data_loader import DataLoader
@@ -18,8 +17,8 @@ def save_checkpoint(state: dict, filename: str) -> None:
 
 def get_parameter_groups(
     model: torch.nn.Module, 
-    base_lr: float, 
-    backbone_lr_scale: float, 
+    head_lr: float, 
+    backbone_lr: float, 
     weight_decay: float
 ) -> list[dict]:
     if hasattr(model, "head") and hasattr(model, "backbone"):
@@ -30,8 +29,8 @@ def get_parameter_groups(
         backbone_params = [p for n, p in model.named_parameters() if "head" not in n.lower()]
 
     return [
-        {"params": head_params, "lr": base_lr, "weight_decay": weight_decay, "name": "head"},
-        {"params": backbone_params, "lr": base_lr * backbone_lr_scale, "weight_decay": weight_decay, "name": "backbone"}
+        {"params": head_params, "lr": head_lr, "weight_decay": weight_decay, "name": "head"},
+        {"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay, "name": "backbone"}
     ]
 
 
@@ -45,9 +44,16 @@ def train(
     device: torch.device,
     opt: argparse.Namespace,
     trial: optuna.trial.Trial | None = None,
-) -> tuple[float, np.ndarray]:
+) -> tuple[float, dict[str, float]]:
     """Run one training epoch and return the average loss and RMSE."""
     model.train()
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+        if model.head is not None:
+            for param in model.head.parameters():
+                param.requires_grad = True  # Ensure the head is trainable
+            
+
     total_loss = 0.0
     all_preds, all_targets = [], []
     num_batches = len(dataloader)
@@ -82,15 +88,15 @@ def train(
         # Scaled backward pass prevents underflow
         if use_amp:
             scaler.scale(loss).backward()
-            if opt.grad_clip > 0.0:
-                scaler.unscale_(optimizer)
-                clip_gradient(optimizer, opt.grad_clip)
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if not torch.isfinite(grad_norm):
+                pass
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            if opt.grad_clip > 0.0:
-                clip_gradient(optimizer, opt.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Optional gradient clipping
             optimizer.step()
 
         total_loss += batch_loss.item() # Only register main loss for logging
@@ -106,12 +112,9 @@ def train(
         print(" " * 100, end="\r")
 
     avg_loss = total_loss / max(num_batches, 1)
-
-    preds_cat = torch.cat(all_preds, dim=0)
-    targets_cat = torch.cat(all_targets, dim=0)
-    rmse_per_dim = torch.sqrt(torch.mean((preds_cat - targets_cat) ** 2, dim=0)).cpu().numpy()
-
-    return avg_loss, rmse_per_dim
+    metrics = compute_metrics(torch.cat(all_preds, dim=0), torch.cat(all_targets, dim=0))
+    
+    return avg_loss, metrics
 
 
 def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = None) -> tuple[float, np.ndarray, list[str]]:
@@ -122,8 +125,7 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     if opt.dataset.lower() == "afew":
         opt.VAD_weights = [opt.VAD_weights[0], opt.VAD_weights[1], 0.0]
 
-    target_names = []
-    active_weights = []
+    target_names, active_weights = [], []
     for name, w in zip(["Valence", "Arousal", "Dominance"], opt.VAD_weights):
         if w > 0:
             target_names.append(name)
@@ -159,12 +161,13 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
             f"A-{opt.VAD_weights[1]:.2f}_"
             f"D-{opt.VAD_weights[2]:.2f}_"
             f"opt-{opt.optimizer}_"
-            f"lr-{opt.learning_rate:.5f}_"
-            f"backbonelr-{opt.backbone_lr_scale:.2f}_"
+            f"headlr-{opt.head_lr:.5f}_"
+            f"backbonelr-{opt.backbone_lr:.2f}_"
             f"decay-{opt.weight_decay:.1e}_"
             f"bs-{opt.batch_size}_"
             f"dropout-{opt.dropout_rate:.2f}_"
-            f"aug-{opt.data_augmentation}"
+            f"aug-{opt.data_augmentation}_"
+            f"scheduler-{opt.scheduler}"
         )
         path = os.path.join(opt.output_dir, folder_name)
         os.makedirs(path, exist_ok=True)
@@ -172,7 +175,14 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
 
     # Model Initialization
     num_channels = 1 if opt.pretrained and opt.weights_source == "custom" else 3
-    model = load_model(opt.model, num_channels=num_channels, num_outputs=num_outputs, dropout_rate=opt.dropout_rate, freezed=opt.freezed, display=not is_optuna)
+    model = load_model(
+        opt.model, 
+        num_channels=num_channels, 
+        num_outputs=num_outputs, 
+        dropout_rate=opt.dropout_rate, 
+        freezed=opt.freezed, 
+        display=not is_optuna
+    )
     pretrain_dataset_name = None
     if opt.pretrained:
         model, pretrain_dataset_name = load_pretrained_weights(
@@ -188,6 +198,7 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     scaler = torch.amp.GradScaler("cuda", enabled=opt.use_amp and device.type == "cuda")
 
     # Target label statistics and image statistics
+    DataLoader.display = not is_optuna
     DataLoader.set_data_protocol("small_split")
     DataLoader.set_num_channels(num_channels)
     DataLoader._ensure_image_stats(opt.dataset)
@@ -209,47 +220,9 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
         if num_channels == 1 and len(image_mean) > 1:
             image_mean = [image_mean[0]]
             image_std = [image_std[0]]
-
-    # Transforms
-
-    padding_size = int(opt.input_size * 0.15)
-    crop_resolution = opt.input_size
+            
     
-    if opt.data_augmentation:
-        train_transform = transforms.Compose([
-            # 1. Resize & Random Crop
-            transforms.Resize((opt.input_size + padding_size, opt.input_size + padding_size)),
-            transforms.RandomCrop((crop_resolution, crop_resolution)),
-            
-            # 2. Geometric Transformations
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=(-10.0, 10.0)),
-            
-            # 3. Photometric Augmentations
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-            
-            # 4. Conversion & Normalization
-            transforms.ToImage(),
-            transforms.ToDtype(torch.float32, scale=True),  # Replaces ToTensor (converts [0, 255] uint8 -> [0.0, 1.0] float32)
-            transforms.Normalize(mean=image_mean, std=image_std),
-            
-            # 5. Facial Occlusions
-            transforms.RandomErasing(p=0.25, scale=(0.02, 0.20), ratio=(0.3, 3.3))
-        ])
-    else:
-        train_transform = transforms.Compose([
-            transforms.Resize((opt.input_size, opt.input_size)),
-            transforms.ToImage(),
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(mean=image_mean, std=image_std),
-        ])
-
-    val_transform = transforms.Compose([
-        transforms.Resize((opt.input_size, opt.input_size)),
-        transforms.ToImage(),
-        transforms.ToDtype(torch.float32, scale=True),
-        transforms.Normalize(mean=image_mean, std=image_std),
-    ])
+    train_transform, val_transform = get_transforms(image_mean=image_mean, image_std=image_std, input_size=opt.input_size, data_augmentation=opt.data_augmentation)
 
     # DataLoaders
     train_dataset = DataLoader(opt.dataset, split="Train", include_V=include_V, include_A=include_A, include_D=include_D, transform=train_transform, display=not is_optuna)
@@ -261,40 +234,61 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
     # Optimizer with Parameter Groups for Differential Learning Rates
     param_groups = get_parameter_groups(
         model, 
-        base_lr=opt.learning_rate, 
-        backbone_lr_scale=opt.backbone_lr_scale, 
+        head_lr=opt.head_lr, 
+        backbone_lr=opt.backbone_lr, 
         weight_decay=opt.weight_decay
     )
 
-    if opt.optimizer == "adam":
-        optimizer = torch.optim.Adam(param_groups)
-    elif opt.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(param_groups)
-    elif opt.optimizer == "sgd":
-        optimizer = torch.optim.SGD(param_groups)
-    else:
-        raise ValueError(f"Unsupported optimizer: {opt.optimizer}")
+    optimizers = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW, "sgd": torch.optim.SGD}
+    optimizer = optimizers[opt.optimizer.lower()](param_groups)
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=opt.lr_factor,
-        patience=opt.lr_patience,
-        threshold=opt.lr_threshold,
-        threshold_mode=opt.lr_threshold_mode,
-        cooldown=opt.lr_cooldown,
-        min_lr=opt.lr_min,
-    )
+
+
+    if opt.scheduler == "reduce_on_plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=opt.lr_factor,
+            patience=opt.lr_patience,
+            threshold=opt.lr_threshold,
+            threshold_mode=opt.lr_threshold_mode,
+            cooldown=opt.lr_cooldown,
+            min_lr=opt.lr_min,
+        )
+    elif opt.scheduler == "cosine_annealing":
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=opt.lr_warmup_epochs
+        )
+        base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=opt.epochs,
+            eta_min=opt.lr_min
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, base_scheduler],
+            milestones=[opt.lr_warmup_epochs]
+        )    
 
     # Logging
     if not is_optuna:
         log_file = os.path.join(path, "log.csv")
+        header = [
+            "epoch", "train_loss", "train_mse", "train_rmse", "train_ccc",
+            "val_loss", "val_mse", "val_rmse", "val_ccc"
+        ]
+        for metric in ["mse", "rmse", "ccc"]:
+            header.extend([f"train_{metric}_{n}" for n in target_names])
+            header.extend([f"val_{metric}_{n}" for n in target_names])
+
         with open(log_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["epoch", "train_loss"] + [f"{n}_train_rmse" for n in target_names] + ["val_loss"] + [f"{n}_val_rmse" for n in target_names])
+            csv.writer(f).writerow(header)
 
     best_score = float("inf")
-    best_val_rmse = None
+    best_val_metrics = {f"{metric}_overall": "N/A" for metric in ["mse", "rmse", "ccc"]} | {f"{metric}_per_dim_{dim}": "N/A" for metric in ["mse", "rmse", "ccc"] for dim in target_names} | {f"pred_std_{dim}": "N/A" for dim in target_names}
     early_stop_counter = 0
 
     for epoch in range(opt.epochs):
@@ -306,26 +300,49 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
                 param.requires_grad = True
 
         with torch.amp.autocast(device_type="cuda", enabled=opt.use_amp and device.type == "cuda"):
-            train_loss, train_rmse = train(epoch, trainloader, model, optimizer, scaler, weights_tensor, device, opt, trial)
-            val_loss, val_rmse = evaluate(valloader, model, opt.criterion, alpha=opt.ccc_weight, weights=weights_tensor, device=device, trial=trial)
+            train_loss, train_m = train(epoch, trainloader, model, optimizer, scaler, weights_tensor, device, opt, trial)
+            val_loss, val_m = evaluate(valloader, model, weights=weights_tensor, criterion_type=opt.criterion, alpha=opt.ccc_weight, device=device, trial=trial)
         val_loss_float = float(val_loss.item()) if hasattr(val_loss, "item") else float(val_loss)
 
-        if not is_optuna:
-            print(f"Train Loss: {train_loss:.4f} | {' | '.join(f'Train RMSE {name}: {rmse:.4f}' for name, rmse in zip(target_names, train_rmse))}")
-            print(f"Val Loss: {val_loss:.4f} | {' | '.join(f'Val RMSE {name}: {rmse:.4f}' for name, rmse in zip(target_names, val_rmse))}")
+        if is_optuna:
+            print(f"[Trial {trial.number} | Epoch {epoch} ] Train Loss: {train_loss:6.4f} -> RMSE: {train_m['rmse_overall']:6.4f}, CCC: {train_m['ccc_overall']:6.4f}"
+                  f" | Val Loss: {val_loss_float:6.4f} -> RMSE: {val_m['rmse_overall']:6.4f}, CCC: {val_m['ccc_overall']:6.4f}", end="\r")
+        else:
+            print(f"Train Loss: {train_loss:.4f} | MSE: {train_m['mse_overall']:.4f} | RMSE: {train_m['rmse_overall']:.4f} | CCC: {train_m['ccc_overall']:.4f}")
+            print(f"Val Loss:   {val_loss_float:.4f} | MSE: {val_m['mse_overall']:.4f} | RMSE: {val_m['rmse_overall']:.4f} | CCC: {val_m['ccc_overall']:.4f}")
+
+            std_str = " | ".join(f"{n}: {std:.4f}" for n, std in zip(target_names, train_m['pred_std']))
+            rmse_str = " | ".join(f"{n}: {rmse:.4f}" for n, rmse in zip(target_names, val_m['rmse_per_dim']))
+            ccc_str = " | ".join(f"{n}: {ccc:.4f}" for n, ccc in zip(target_names, val_m['ccc_per_dim']))
+            print(f"Pred StdDev      -> {std_str}")
+            print(f"Per-Dim Val RMSE -> {rmse_str}")
+            print(f"Per-Dim Val CCC  -> {ccc_str}")
+
+            row = [
+                epoch, train_loss, train_m["mse_overall"], train_m["rmse_overall"], train_m["ccc_overall"],
+                val_loss_float, val_m["mse_overall"], val_m["rmse_overall"], val_m["ccc_overall"],
+            ]
+            row.extend(train_m["mse_per_dim"] + val_m["mse_per_dim"])
+            row.extend(train_m["rmse_per_dim"] + val_m["rmse_per_dim"])
+            row.extend(train_m["ccc_per_dim"] + val_m["ccc_per_dim"])
 
             with open(log_file, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([epoch, train_loss] + train_rmse.tolist() + [val_loss_float] + val_rmse.tolist())
+                csv.writer(f).writerow(row)
 
-        scheduler.step(val_loss_float)
+        if opt.scheduler == "reduce_on_plateau":
+            scheduler.step(val_loss_float)
+        else:
+            scheduler.step()
 
         if val_loss_float < best_score:
             best_score = val_loss_float
-            best_val_rmse = val_rmse
+            best_val_metrics = val_m
             early_stop_counter = 0
-            if not opt.no_model_save and not is_optuna:
-                torch.save(model.state_dict(), os.path.join(path, "best_model_state.pth"))
+            if is_optuna:
+                trial.set_user_attr("best_val_metrics", best_val_metrics)
+            else:
+                if not opt.no_model_save:
+                    torch.save(model.state_dict(), os.path.join(path, "best_model_state.pth"))
         else:
             early_stop_counter += 1
 
@@ -333,12 +350,13 @@ def run_training(opt: argparse.Namespace, trial: optuna.trial.Trial | None = Non
             break
 
         # Optuna Intermediate Pruning Check
-        if trial is not None:
-            trial.report(val_loss_float, epoch)
+        if is_optuna:
+            trial.report(val_loss_float, step=epoch)
             if trial.should_prune():
+                print(" "* 150, end="\r")
                 raise optuna.exceptions.TrialPruned()
 
-    return float(best_score), best_val_rmse, target_names
+    return float(best_score), best_val_metrics, target_names
 
 
 def build_parser():
@@ -351,8 +369,8 @@ def build_parser():
     parser.add_argument("--output_dir", type=str, default="./output", help="Directory to save logs and model checkpoints (default: ./output)")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training (default: 32)")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs (default: 100)")
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate for the optimizer head (default: 1e-4)")
-    parser.add_argument("--backbone_lr_scale", type=float, default=0.1, help="Scale factor for backbone learning rate relative to head LR (default: 0.1)")
+    parser.add_argument("--head_lr", type=float, default=1e-3, help="Learning rate for the optimizer head (default: 1e-4)")
+    parser.add_argument("--backbone_lr", type=float, default=1e-4, help="Learning rate for the optimizer backbone (default: 1.0)")
     parser.add_argument("--unfreeze_epoch", type=int, default=0, help="Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)")
     parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay for the optimizer (default: 5e-4)")
     parser.add_argument("--model", type=str, default="vgg16", choices=["vgg11", "vgg13", "vgg16", "vgg19", "resnet18", "resnet34", "resnet50", "efficientnet", "mobilenet", "mobilefacenet"], help="Model architecture to use (default: vgg16)")
@@ -362,7 +380,6 @@ def build_parser():
     parser.add_argument("--dropout_rate", type=float, default=0.5, help="Dropout rate for the regression head (default: 0.5)")
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "sgd", "adamw"], help="Optimizer to use for training (default: sgd)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"], help="Device to use for training (default: cuda if available, otherwise cpu)")
-    parser.add_argument("--grad_clip", type=float, default=0.0, help="Gradient clipping value (default: 0.0, no clipping)")
     parser.add_argument("--data_augmentation", action="store_true", help="Apply data augmentation during training (default: False)")
     parser.add_argument("--use_amp", action="store_true", default=True, help="Use Automatic Mixed Precision (AMP) training (default: True)")
     parser.add_argument("--resume", action="store_true", help="Resume training from a previous checkpoint (default: False)")
@@ -372,12 +389,14 @@ def build_parser():
     parser.add_argument("--VAD_weights", type=parse_csv_floats, default="1.0, 1.0, 1.0", help="Weights for the VAD loss (default: \"1.0, 1.0, 1.0\")")
     parser.add_argument("--orth_loss_weight", type=float, default=0.0, help="Weight for the orthogonal loss (default: 0.5)")
     parser.add_argument("--ccc_weight", type=float, default=0.5, help="Weight for the CCC loss (default: 0.5)")
+    parser.add_argument("--scheduler", type=str, default="reduce_on_plateau", choices=["reduce_on_plateau", "cosine_annealing"], help="Learning rate scheduler to use (default: reduce_on_plateau)")
     parser.add_argument("--lr_factor", type=float, default=0.1, help="Factor by which the learning rate will be reduced (default: 0.1)")
     parser.add_argument("--lr_patience", type=int, default=10, help="Number of epochs with no improvement after which the learning rate will be reduced (default: 10)")
     parser.add_argument("--lr_threshold", type=float, default=1e-4, help="Minimum change in the monitored quantity to qualify as an improvement (default: 1e-4)")
     parser.add_argument("--lr_threshold_mode", type=str, default="rel", help="Mode to compare the monitored quantity to the threshold (default: rel)")
     parser.add_argument("--lr_cooldown", type=int, default=0, help="Number of epochs to wait before resuming normal operation after a reduction in the learning rate (default: 0)")
     parser.add_argument("--lr_min", type=float, default=0.0, help="Lower bound on the learning rate (default: 0.0)")
+    parser.add_argument("--lr_warmup_epochs", type=int, default=5, help="Number of warmup epochs for the learning rate scheduler (default: 5)")
     return parser
 
 

@@ -39,6 +39,8 @@ class DataLoader(data.Dataset):
     size: int = 224 # Dynamic image dimensions fallback
     num_channels: int = 3  # Number of image channels (1 for pretrained models, 3 for training from scratch)
 
+    display: bool = True  # Whether to display progress bars during data processing
+
     @classmethod
     def _repo_root(cls) -> str:
         return os.path.dirname(os.path.abspath(__file__))
@@ -142,7 +144,11 @@ class DataLoader(data.Dataset):
 
         pixels_length = len(train_df["pixels"][0].split())
         cls.size = int(np.sqrt(pixels_length))
-        for pixel_entry in train_df["pixels"]:
+        total_rows = len(train_df)
+        for idx, pixel_entry in enumerate(train_df["pixels"]):
+            progress = (idx + 1) / total_rows
+            bar = "█" * int(progress * 20) + " " * int(20 - int(progress * 20))
+            print(f"Computing image stats: |{bar}| {idx + 1}/{total_rows} [{progress * 100:.2f}%]", end="\r") if cls.display else None
             pixel_str = str(pixel_entry).strip()
             if not pixel_str or pixel_str.lower() == "nan":
                 continue
@@ -155,6 +161,7 @@ class DataLoader(data.Dataset):
                     detected_sizes.append(side)
             except ValueError:
                 continue
+        print(" " * 100, end="\r") if cls.display else None
 
         if detected_sizes:
             unique_sizes = set(detected_sizes)
@@ -244,7 +251,7 @@ class DataLoader(data.Dataset):
 
             pixel_str = str(row["pixels"]).strip()
             if not pixel_str or pixel_str.lower() == "nan":
-                empty_pixels_count += 1
+                dropped_invalid += 1
                 continue
 
             try:

@@ -1,14 +1,17 @@
 import numpy as np
+import argparse
 import random
-import torch
 import os
-import onnx2pytorch
-import onnx
 import re
-from torch.nn import functional as F
 import numpy as np
 from typing import Optional, Tuple
+
+import onnx2pytorch
+import onnx
+import torch
 import torchvision.models as tv_models
+from torch.nn import functional as F
+from torchvision.transforms import v2 as transforms
 
 from models import resnet, vgg, mobilenet, mobilefacenet, efficientnet
 
@@ -28,12 +31,54 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def clip_gradient(optimizer: torch.optim.Optimizer, grad_clip: float) -> None:
-    """Clip gradients computed during backpropagation to avoid explosion of gradients."""
-    for group in optimizer.param_groups:
-        for param in group['params']:
-            if param.grad is not None:
-                param.grad.data.clamp_(-grad_clip, grad_clip)
+def assert_finite(name: str, tensor: torch.Tensor) -> None:
+    if not torch.isfinite(tensor).all():
+        raise FloatingPointError(
+            f"{name} contains NaN/Inf "
+            f"(min={tensor.nan_to_num().min().item()}, "
+            f"max={tensor.nan_to_num().max().item()})"
+        )
+
+
+def set_backbone_trainable(model: torch.nn.Module, trainable: bool) -> None:
+    """Freeze or unfreeze backbone parameters."""
+    if hasattr(model, "backbone"):
+        for p in model.backbone.parameters():
+            p.requires_grad = trainable
+    else:
+        for name, param in model.named_parameters():
+            if "head" not in name.lower():
+                param.requires_grad = trainable
+
+
+
+
+def get_transforms(image_mean: list, image_std: list, input_size: int = 224, data_augmentation: bool = False):
+    """Build train and validation image transform pipelines."""
+    val_transform = transforms.Compose([
+        transforms.Resize((input_size, input_size)),
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+        transforms.Normalize(mean=image_mean, std=image_std),
+    ])
+
+    if not data_augmentation:
+        return val_transform, val_transform
+
+    padding_size = int(input_size * 0.15)
+    train_transform = transforms.Compose([
+        transforms.Resize((input_size + padding_size, input_size + padding_size)),
+        transforms.RandomCrop((input_size, input_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=(-10.0, 10.0)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+        transforms.Normalize(mean=image_mean, std=image_std),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.20), ratio=(0.3, 3.3)),
+    ])
+
+    return train_transform, val_transform
 
 
 def _clean_onnx_prefix(key: str) -> str:
@@ -384,7 +429,7 @@ def compute_batch_loss(
     elif criterion_type == "combined":
         per_dim_mse_loss = mse_criterion(outputs, targets).mean(dim=0)
         per_dim_ccc_loss = ccc_criterion(outputs, targets)
-        per_dim_loss = alpha * per_dim_mse_loss + (1 - alpha) * per_dim_ccc_loss
+        per_dim_loss = alpha * per_dim_ccc_loss + (1 - alpha) * per_dim_mse_loss
     else:
         raise ValueError(f"Unsupported criterion type: {criterion_type}. Choose from 'mse', 'ccc', or 'combined'.")
 
@@ -393,6 +438,40 @@ def compute_batch_loss(
 
     weighted_loss = torch.sum(per_dim_loss * weights, dim=0) / torch.sum(weights)
     return weighted_loss
+
+
+def compute_metrics(preds: torch.Tensor, targets: torch.Tensor) -> dict:
+    """Calculate overall and per-dimension MSE, RMSE, CCC, and Pred StdDev."""
+    preds = preds.detach().cpu().float()
+    targets = targets.detach().cpu().float()
+    num_dims = preds.shape[1]
+
+    # Per-dimension MSE and RMSE
+    mse_per_dim = torch.mean((preds - targets) ** 2, dim=0).numpy()
+    rmse_per_dim = np.sqrt(mse_per_dim)
+
+    # Per-dimension CCC
+    ccc_per_dim = []
+    for i in range(num_dims):
+        p, t = preds[:, i], targets[:, i]
+        p_mean, t_mean = torch.mean(p), torch.mean(t)
+        p_var, t_var = torch.var(p, unbiased=False) + 1e-7, torch.var(t, unbiased=False) + 1e-7
+        cov = torch.mean((p - p_mean) * (t - t_mean))
+        ccc = (2 * cov) / (p_var + t_var + (p_mean - t_mean) ** 2 + 1e-7)
+        ccc_per_dim.append(ccc.item())
+
+    pred_std = torch.std(preds, dim=0)
+
+    return {
+        "mse_overall": float(np.mean(mse_per_dim)),
+        "rmse_overall": float(np.mean(rmse_per_dim)),
+        "ccc_overall": float(np.mean(ccc_per_dim)),
+        "mse_per_dim": list(map(float, mse_per_dim)),
+        "rmse_per_dim": list(map(float, rmse_per_dim)),
+        "ccc_per_dim": list(map(float, ccc_per_dim)),
+        "pred_std": list(map(float, pred_std)),
+    }
+
 
 class CCCLoss(torch.nn.Module):
     """Concordance Correlation Coefficient (CCC) Loss for regression tasks."""
@@ -415,7 +494,7 @@ class CCCLoss(torch.nn.Module):
 
         covariance = torch.mean((preds - mean_preds) * (targets - mean_targets), dim=0)
 
-        ccc = (2.0 * covariance) / (var_preds + var_targets + (mean_preds - mean_targets) ** 2 + 1e-8)
+        ccc = (2.0 * covariance) / torch.clamp(var_preds + var_targets + (mean_preds - mean_targets) ** 2 + 1e-8, min=1e-6)
         return 1.0 - ccc  # Return 1 - CCC as the loss to minimize
 
 

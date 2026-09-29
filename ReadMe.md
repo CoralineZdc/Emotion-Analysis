@@ -71,7 +71,7 @@ Options:
 ```bash
   -h, --help            show this help message and exit
   --seed SEED           Random seed for reproducibility (default: 42)
-  --dataset {fer,caers,afew,emotic,heco}
+  --dataset {fer,caers,afew,emotic,emotic-child,heco}
                         Dataset to use for training and evaluation (default: fer)
   --input_size INPUT_SIZE
                         Image spatial resolution (default: 112)
@@ -84,10 +84,9 @@ Options:
   --batch_size BATCH_SIZE
                         Batch size for training (default: 32)
   --epochs EPOCHS       Number of training epochs (default: 100)
-  --learning_rate LEARNING_RATE
-                        Learning rate for the optimizer head (default: 1e-4)
-  --backbone_lr_scale BACKBONE_LR_SCALE
-                        Scale factor for backbone learning rate relative to head LR (default: 0.1)
+  --head_lr HEAD_LR     Learning rate for the optimizer head (default: 1e-4)
+  --backbone_lr BACKBONE_LR
+                        Learning rate for the optimizer backbone (default: 1.0)
   --unfreeze_epoch UNFREEZE_EPOCH
                         Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)
   --weight_decay WEIGHT_DECAY
@@ -103,9 +102,8 @@ Options:
   --optimizer {adam,sgd,adamw}
                         Optimizer to use for training (default: sgd)
   --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
-  --grad_clip GRAD_CLIP
-                        Gradient clipping value (default: 0.0, no clipping)
   --data_augmentation   Apply data augmentation during training (default: False)
+  --use_amp             Use Automatic Mixed Precision (AMP) training (default: True)
   --resume              Resume training from a previous checkpoint (default: False)
   --no_checkpoint       Do not save checkpoints (default: False)
   --no_model_save       Do not save the model (default: False)
@@ -117,6 +115,8 @@ Options:
                         Weight for the orthogonal loss (default: 0.5)
   --ccc_weight CCC_WEIGHT
                         Weight for the CCC loss (default: 0.5)
+  --scheduler {reduce_on_plateau,cosine_annealing}
+                        Learning rate scheduler to use (default: reduce_on_plateau)
   --lr_factor LR_FACTOR
                         Factor by which the learning rate will be reduced (default: 0.1)
   --lr_patience LR_PATIENCE
@@ -128,6 +128,8 @@ Options:
   --lr_cooldown LR_COOLDOWN
                         Number of epochs to wait before resuming normal operation after a reduction in the learning rate (default: 0)
   --lr_min LR_MIN       Lower bound on the learning rate (default: 0.0)
+  --lr_warmup_epochs LR_WARMUP_EPOCHS
+                        Number of warmup epochs for the learning rate scheduler (default: 5)
 ```
 
 ### Evaluate a model
@@ -170,17 +172,14 @@ Options:
 
 Runs Hyperparameter Optimization with Optuna on desired model and dataset.
 
+```bash
+python -m src.training.optuna_search
+```
+
 Options:
 
 ```bash
   -h, --help            show this help message and exit
-  --n_trials N_TRIALS   Number of Optuna trials
-  --optuna_seed OPTUNA_SEED
-                        Random seed for reproducibility
-  --study_name STUDY_NAME
-  --storage STORAGE
-  --log_dir LOG_DIR
-  --resume_study        Resume an existing Optuna study if it exists
   --seed SEED           Random seed for reproducibility (default: 42)
   --dataset {fer,caers,afew,emotic,emotic-child,heco}
                         Dataset to use for training and evaluation (default: fer)
@@ -195,10 +194,9 @@ Options:
   --batch_size BATCH_SIZE
                         Batch size for training (default: 32)
   --epochs EPOCHS       Number of training epochs (default: 100)
-  --learning_rate LEARNING_RATE
-                        Learning rate for the optimizer head (default: 1e-4)
-  --backbone_lr_scale BACKBONE_LR_SCALE
-                        Scale factor for backbone learning rate relative to head LR (default: 0.1)
+  --head_lr HEAD_LR     Learning rate for the optimizer head (default: 1e-4)
+  --backbone_lr BACKBONE_LR
+                        Learning rate for the optimizer backbone (default: 1.0)
   --unfreeze_epoch UNFREEZE_EPOCH
                         Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)
   --weight_decay WEIGHT_DECAY
@@ -214,9 +212,8 @@ Options:
   --optimizer {adam,sgd,adamw}
                         Optimizer to use for training (default: sgd)
   --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
-  --grad_clip GRAD_CLIP
-                        Gradient clipping value (default: 0.0, no clipping)
   --data_augmentation   Apply data augmentation during training (default: False)
+  --use_amp             Use Automatic Mixed Precision (AMP) training (default: True)
   --resume              Resume training from a previous checkpoint (default: False)
   --no_checkpoint       Do not save checkpoints (default: False)
   --no_model_save       Do not save the model (default: False)
@@ -228,6 +225,8 @@ Options:
                         Weight for the orthogonal loss (default: 0.5)
   --ccc_weight CCC_WEIGHT
                         Weight for the CCC loss (default: 0.5)
+  --scheduler {reduce_on_plateau,cosine_annealing}
+                        Learning rate scheduler to use (default: reduce_on_plateau)
   --lr_factor LR_FACTOR
                         Factor by which the learning rate will be reduced (default: 0.1)
   --lr_patience LR_PATIENCE
@@ -239,12 +238,25 @@ Options:
   --lr_cooldown LR_COOLDOWN
                         Number of epochs to wait before resuming normal operation after a reduction in the learning rate (default: 0)
   --lr_min LR_MIN       Lower bound on the learning rate (default: 0.0)
-  --range_learning_rate RANGE_LEARNING_RATE
-                        'Min, Max' bounds for LR
+  --lr_warmup_epochs LR_WARMUP_EPOCHS
+                        Number of warmup epochs for the learning rate scheduler (default: 5)
+  --n_trials N_TRIALS   Number of Optuna trials
+  --optuna_seed OPTUNA_SEED
+                        Random seed for reproducibility
+  --study_name STUDY_NAME
+  --storage STORAGE
+  --log_dir LOG_DIR
+  --resume_study        Resume an existing Optuna study if it exists
+  --pruner {hyperband,median,none}
+                        Pruner type for Optuna trials
+  --range_model RANGE_MODEL
+                        Backbone model options
+  --range_head_lr RANGE_HEAD_LR
+                        'Min, Max' bounds for head LR
+  --range_backbone_lr RANGE_BACKBONE_LR
+                        'Min, Max' bounds for backbone LR
   --range_weight_decay RANGE_WEIGHT_DECAY
                         'Min, Max' bounds for weight decay
-  --range_backbone_lr_scale RANGE_BACKBONE_LR_SCALE
-                        'Min, Max' bounds for backbone LR scaling
   --range_unfreeze_epoch RANGE_UNFREEZE_EPOCH
                         'Min, Max' bounds for unfreeze epoch
   --range_input_size RANGE_INPUT_SIZE
@@ -263,10 +275,14 @@ Options:
                         'Min, Max, Step' for CCC loss weight
   --range_orth_loss_weight RANGE_ORTH_LOSS_WEIGHT
                         'Min, Max, Step' for orth loss weight
+  --range_scheduler RANGE_SCHEDULER
+                        Schedulers to search over
   --range_lr_factor RANGE_LR_FACTOR
                         Discrete learning rate decay factors
   --range_lr_patience RANGE_LR_PATIENCE
                         'Min, Max' bounds for scheduler patience
+  --range_lr_warmup_epochs RANGE_SCHEDULER_WARMUP_EPOCHS
+                        'Min, Max' bounds for warmup epochs
 ```
 
 ### Analyze HPO results

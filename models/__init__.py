@@ -3,6 +3,8 @@
 from torch import nn
 from abc import ABC, abstractmethod
 
+import torch
+
 class Model(nn.Module, ABC):
 
     def __init__(self, model_name: str, num_channels: int = 3, num_outputs: int = 1, dropout_rate: float = 0.3, freezed: bool = False):
@@ -70,8 +72,11 @@ class RegressionHead(nn.Module):
             nn.BatchNorm1d(hidden_features),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_features, out_features)  # <--- NO Sigmoid / Tanh here
+            nn.Linear(hidden_features, out_features), 
         )
 
+        nn.init.xavier_uniform_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, 0.0)
+
     def forward(self, x):
-        return self.net(x)
+        return 1.1 * torch.tanh(self.net(x))
