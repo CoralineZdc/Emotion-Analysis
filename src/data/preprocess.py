@@ -1,7 +1,7 @@
+"""Preprocessing utilities for continuous emotion datasets (VAD)."""
+
 import argparse
-import glob
 import json
-import os
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -14,6 +14,8 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
+from src.utils import crop_bbox, image_to_pixel_string, compute_range_agnostic_bins
+
 
 @dataclass
 class VADSample:
@@ -23,8 +25,20 @@ class VADSample:
     arousal: float
     dominance: Optional[float]
     pixels: str
-    group_id: Optional[str] = None  # Used for group-based splitting (e.g., video ID)
+    group_id: Optional[str] = None
     age: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Union[str, float]]:
+        """Converts the VADSample instance to a dictionary for CSV export."""
+        data = {
+            "name": self.name,
+            "Valence": self.valence,
+            "Arousal": self.arousal,
+        }
+        if self.dominance is not None:
+            data["Dominance"] = self.dominance
+        data["pixels"] = self.pixels
+        return data
 
 
 class PreprocessDataset(ABC):
@@ -59,6 +73,14 @@ class PreprocessDataset(ABC):
         random.seed(self.seed)
 
 
+    def __enter__(self):
+        return self
+
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
     @property
     def face_detector(self):
         """Lazily initializes and returns a MediaPipe face detector."""
@@ -74,7 +96,16 @@ class PreprocessDataset(ABC):
             image: Image.Image,
             fallback_ratio: Optional[float] = 0.35
     ) -> Image.Image:
-        """Generic face detection and cropping using MediaPipe, with optional fallback."""
+        """
+        Extract a face crop from an image using MediaPipe, with optional fallback.
+        
+        Args:
+            image: The input image.
+            fallback_ratio: The ratio of the image height to use as a fallback crop.
+
+        Returns:
+            The cropped face image.
+        """
         img_rgb = np.array(image.convert("RGB"))
         h_img, w_img, _ = img_rgb.shape
 
@@ -100,32 +131,11 @@ class PreprocessDataset(ABC):
         return image
 
 
-    def process_image_to_pixel_string(self, img_input: Union[Image.Image, np.ndarray]) -> str:
-        """Converts PIL Image or numpy array to a space-separated 1D grayscale pixel string."""
-        if not isinstance(img_input, Image.Image):
-            arr = np.asarray(img_input)
-            if arr.ndim == 3 and arr.shape[0] in (1, 3):  # Convert (C, H, W) -> (H, W, C)
-                arr = np.transpose(arr, (1, 2, 0))
-            if arr.dtype != np.uint8:
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-            img = Image.fromarray(arr)
-        else:
-            img = img_input
-
-        gray_img = img.convert("L")
-        if self.target_size is not None:
-            gray_img = gray_img.resize(self.target_size, Image.Resampling.BILINEAR)
-
-        pixel_array = np.array(gray_img, dtype=np.uint8).flatten()
-        return " ".join(pixel_array.astype(str))
-
     def predict_age(self, img_input: Union[Image.Image, np.ndarray]) -> Optional[str]:
         """Placeholder for age prediction; can be overridden in subclasses."""
         return None
 
-    # -------------------------------------------------------------------------
-    # Abstract Methods to Implement in Subclasses
-    # -------------------------------------------------------------------------
+
     @abstractmethod
     def crop_sample(self, raw_source: Union[Path, Image.Image, np.ndarray], **kwargs) -> Image.Image:
         """Dataset-specific face/subject cropping strategy."""
@@ -141,51 +151,29 @@ class PreprocessDataset(ABC):
         """
         pass
 
-    # -------------------------------------------------------------------------
-    # Generic Splitting & Export Pipeline
-    # -------------------------------------------------------------------------
-    @staticmethod
-    def _compute_range_agnostic_bins(values: np.ndarray, n_bins: int = 4) -> np.ndarray:
-        """Computes discrete bin indices in a range-agnostic manner.
-        
-        Uses quantile binning (percentiles) first; falls back to min-max 
-        uniform binning if quantiles fail due to low variance.
-        """
-        if len(values) == 0:
-            return np.array([], dtype=int)
-            
-        # Strategy 1: Quantile/percentile binning (inherently scale-agnostic)
-        try:
-            return pd.qcut(values, q=n_bins, labels=False, duplicates='drop')
-        except Exception:
-            pass
-
-        # Strategy 2: Dynamic Min-Max normalization fallback
-        v_min, v_max = values.min(), values.max()
-        if np.isclose(v_min, v_max):
-            return np.zeros(len(values), dtype=int)
-
-        normalized = (values - v_min) / (v_max - v_min + 1e-7)
-        return np.clip((normalized * n_bins).astype(int), 0, n_bins - 1)
-
 
     def split_dataset(
             self, samples: List[VADSample]
         ) -> Dict[str, List[VADSample]]:
-        """Splits samples into train/val/test with scale-agnostic VAD/VA stratification and group leakage prevention."""
+        """
+        Splits samples into train/val/test with scale-agnostic VAD/VA stratification and group leakage prevention.
+        
+        Args:
+            samples (List[VADSample]): The list of samples to split.
+            
+        Returns:
+            Dict[str, List[VADSample]]: A dictionary with the split samples.
+        """
         train_r, val_r, test_r = self.split_ratios
         if not np.isclose(train_r + val_r + test_r, 1.0):
             raise ValueError("Split ratios must sum up to 1.0")
 
         rng = random.Random(self.seed)
 
-        # 1. Determine if Dominance is available across samples
         has_dominance = any(s.dominance is not None for s in samples)
-        n_bins = 3 if has_dominance else 4  # 3^3 = 27 strata vs 4^2 = 16 strata
+        n_bins = 3 if has_dominance else 4
 
-        # -------------------------------------------------------------
-        # CASE A: Group-Based Splitting (Prevents Data Leakage)
-        # -------------------------------------------------------------
+        # Group-based splitting to prevent leakage if group_id is present
         if any(s.group_id is not None for s in samples):
             groups: Dict[str, List[VADSample]] = {}
             for s in samples:
@@ -194,28 +182,31 @@ class PreprocessDataset(ABC):
 
             group_ids = list(groups.keys())
 
+            # Determine stratification bins based on mean VAD values per group
             mean_v = np.array([np.mean([s.valence for s in groups[gid]]) for gid in group_ids])
             mean_a = np.array([np.mean([s.arousal for s in groups[gid]]) for gid in group_ids])
 
-            v_bins = self._compute_range_agnostic_bins(mean_v, n_bins=n_bins)
-            a_bins = self._compute_range_agnostic_bins(mean_a, n_bins=n_bins)
+            v_bins = compute_range_agnostic_bins(mean_v, n_bins=n_bins)
+            a_bins = compute_range_agnostic_bins(mean_a, n_bins=n_bins)
 
             if has_dominance:
                 mean_d = np.array([
                     np.mean([s.dominance for s in groups[gid] if s.dominance is not None])
                     for gid in group_ids
                 ])
-                d_bins = self._compute_range_agnostic_bins(mean_d, n_bins=n_bins)
+                d_bins = compute_range_agnostic_bins(mean_d, n_bins=n_bins)
                 strata_keys = [f"{vb}_{ab}_{db}" for vb, ab, db in zip(v_bins, a_bins, d_bins)]
             else:
                 strata_keys = [f"{vb}_{ab}" for vb, ab in zip(v_bins, a_bins)]
 
+            # Map each group to its stratum
             strata_map: Dict[str, List[Tuple[str, int]]] = {}
             for gid, stratum in zip(group_ids, strata_keys):
                 strata_map.setdefault(stratum, []).append((gid, len(groups[gid])))
 
             splits: Dict[str, List[VADSample]] = {"train": [], "val": [], "test": []}
 
+            # Split the groups into train, val, and test sets
             for stratum, g_list in strata_map.items():
                 rng.shuffle(g_list)
                 tot_stratum_samples = sum(count for _, count in g_list)
@@ -235,18 +226,16 @@ class PreprocessDataset(ABC):
 
             return splits
 
-        # -------------------------------------------------------------
-        # CASE B: Standard Sample-Level Stratified Split
-        # -------------------------------------------------------------
+        # Standard sample-level stratified split
         v_vals = np.array([s.valence for s in samples])
         a_vals = np.array([s.arousal for s in samples])
 
-        v_bins = self._compute_range_agnostic_bins(v_vals, n_bins=n_bins)
-        a_bins = self._compute_range_agnostic_bins(a_vals, n_bins=n_bins)
+        v_bins = compute_range_agnostic_bins(v_vals, n_bins=n_bins)
+        a_bins = compute_range_agnostic_bins(a_vals, n_bins=n_bins)
 
         if has_dominance:
             d_vals = np.array([s.dominance if s.dominance is not None else 0.0 for s in samples])
-            d_bins = self._compute_range_agnostic_bins(d_vals, n_bins=n_bins)
+            d_bins = compute_range_agnostic_bins(d_vals, n_bins=n_bins)
             strata_keys = [f"{vb}_{ab}_{db}" for vb, ab, db in zip(v_bins, a_bins, d_bins)]
         else:
             strata_keys = [f"{vb}_{ab}" for vb, ab in zip(v_bins, a_bins)]
@@ -394,7 +383,7 @@ class PreprocessAFEW(PreprocessDataset):
                             continue
 
                     cropped_img = self.crop_sample(img)
-                    pixel_str = self.process_image_to_pixel_string(cropped_img)
+                    pixel_str = image_to_pixel_string(cropped_img)
 
                 all_samples.append(
                     VADSample(
@@ -544,7 +533,7 @@ class PreprocessEMOTIC(PreprocessDataset):
 
                 crops = array_cache[crop_file]
                 if crops is not None and row["crop_file_idx"] < len(crops):
-                    pixel_str = self.process_image_to_pixel_string(crops[row["crop_file_idx"]])
+                    pixel_str = image_to_pixel_string(crops[row["crop_file_idx"]])
 
             # Strategy 2: Full image numpy array + Bounding Box
             if pixel_str is None and "Arr_name" in row and pd.notna(row["Arr_name"]):
@@ -555,7 +544,7 @@ class PreprocessEMOTIC(PreprocessDataset):
                 arrs = array_cache[arr_file]
                 if arrs is not None and row["arr_file_idx"] < len(arrs):
                     cropped_img = self.crop_sample(arrs[row["arr_file_idx"]], bbox=bbox)
-                    pixel_str = self.process_image_to_pixel_string(cropped_img)
+                    pixel_str = image_to_pixel_string(cropped_img)
 
             # Strategy 3: Raw image file on disk + Bounding Box
             if pixel_str is None and "Filename" in row and pd.notna(row["Filename"]):
@@ -564,7 +553,7 @@ class PreprocessEMOTIC(PreprocessDataset):
                     try:
                         with Image.open(raw_path) as raw_img:
                             cropped = self.crop_sample(raw_img, bbox=bbox)
-                            pixel_str = self.process_image_to_pixel_string(cropped)
+                            pixel_str = image_to_pixel_string(cropped)
                     except Exception:
                         pass
 
@@ -666,7 +655,7 @@ class PreprocessHECO(PreprocessDataset):
             try:
                 with Image.open(img_path) as raw_img:
                     cropped_face = self.crop_sample(raw_img, bbox=bbox)
-                    pixel_str = self.process_image_to_pixel_string(cropped_face)
+                    pixel_str = image_to_pixel_string(cropped_face)
 
                     # Hook for future age-based filtering; currently a placeholder
                     if self.target_age:

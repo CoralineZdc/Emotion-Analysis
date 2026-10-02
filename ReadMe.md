@@ -66,54 +66,70 @@ When saved, the weights which gave the best performances can be found in /output
 python -m src.training.train
 ```
 
-Options:
+#### Execution parameters
 
 ```bash
   -h, --help            show this help message and exit
+  --output_dir OUTPUT_DIR
+                        Directory to save logs and checkpoints (default: outputs)
   --seed SEED           Random seed for reproducibility (default: 42)
+  --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
+  --resume              Resume training from a previous checkpoint (default: False)
+  --no_model_save       Do not save the model (default: False)
+  --num_workers NUM_WORKERS
+                        DataLoader subprocess workers (default: 4)
+  --use_amp             Use Automatic Mixed Precision (AMP) training (default: True)
+  --early_stopping_patience EARLY_STOPPING_PATIENCE
+                        Number of epochs with no improvement after which training will be stopped (default: 20)
+  --epochs EPOCHS       Number of training epochs (default: 100)
+```
+
+#### Dataset parameters
+
+```bash
   --dataset {fer,caers,afew,emotic,emotic-child,heco}
                         Dataset to use for training and evaluation (default: fer)
   --input_size INPUT_SIZE
                         Image spatial resolution (default: 112)
-  --num_workers NUM_WORKERS
-                        DataLoader subprocess workers (default: 4)
-  --early_stopping_patience EARLY_STOPPING_PATIENCE
-                        Number of epochs with no improvement after which training will be stopped (default: 20)
-  --output_dir OUTPUT_DIR
-                        Directory to save logs and model checkpoints (default: ./output)
   --batch_size BATCH_SIZE
                         Batch size for training (default: 32)
-  --epochs EPOCHS       Number of training epochs (default: 100)
-  --head_lr HEAD_LR     Learning rate for the optimizer head (default: 1e-4)
-  --backbone_lr BACKBONE_LR
-                        Learning rate for the optimizer backbone (default: 1.0)
-  --unfreeze_epoch UNFREEZE_EPOCH
-                        Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)
-  --weight_decay WEIGHT_DECAY
-                        Weight decay for the optimizer (default: 5e-4)
+```
+
+#### Model definition parameters
+
+```bash
   --model {vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,efficientnet,mobilenet,mobilefacenet}
-                        Model architecture to use (default: vgg16)
   --pretrained          Use pre-trained weights (default: False)
   --weights_source {imagenet,custom}
                         Source of pre-trained weights (default: imagenet)
   --freezed             Freeze the convolutional layers of the model (default: False)
+                        Model architecture to use (default: vgg16)
+  --unfreeze_epoch UNFREEZE_EPOCH
+  --head_lr HEAD_LR     Learning rate for the optimizer head (default: 1e-4)
+  --backbone_lr BACKBONE_LR
+                        Learning rate for the optimizer backbone (default: 1.0)
+                        Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)
   --dropout_rate DROPOUT_RATE
                         Dropout rate for the regression head (default: 0.5)
-  --optimizer {adam,sgd,adamw}
-                        Optimizer to use for training (default: sgd)
-  --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
-  --data_augmentation   Apply data augmentation during training (default: False)
-  --use_amp             Use Automatic Mixed Precision (AMP) training (default: True)
-  --resume              Resume training from a previous checkpoint (default: False)
-  --no_checkpoint       Do not save checkpoints (default: False)
-  --no_model_save       Do not save the model (default: False)
+```
+
+#### Loss criterion and backpropagation parameters
+
+```bash
   --criterion {mse,ccc,combined}
                         Loss function to use for training (default: mse)
   --VAD_weights VAD_WEIGHTS
                         Weights for the VAD loss (default: "1.0, 1.0, 1.0")
-  --orth_loss_weight ORTH_LOSS_WEIGHT
-                        Weight for the orthogonal loss (default: 0.5)
   --ccc_weight CCC_WEIGHT
+  --optimizer {adam,sgd,adamw}
+                        Optimizer to use for training (default: sgd)
+  --max_grad_norm MAX_GRAD_NORM
+                        Maximum norm for gradient clipping (default: 1.0, set 0 to disable)
+```
+
+#### Scheduler parameters
+
+```bash
                         Weight for the CCC loss (default: 0.5)
   --scheduler {reduce_on_plateau,cosine_annealing}
                         Learning rate scheduler to use (default: reduce_on_plateau)
@@ -121,15 +137,14 @@ Options:
                         Factor by which the learning rate will be reduced (default: 0.1)
   --lr_patience LR_PATIENCE
                         Number of epochs with no improvement after which the learning rate will be reduced (default: 10)
-  --lr_threshold LR_THRESHOLD
-                        Minimum change in the monitored quantity to qualify as an improvement (default: 1e-4)
-  --lr_threshold_mode LR_THRESHOLD_MODE
-                        Mode to compare the monitored quantity to the threshold (default: rel)
-  --lr_cooldown LR_COOLDOWN
-                        Number of epochs to wait before resuming normal operation after a reduction in the learning rate (default: 0)
-  --lr_min LR_MIN       Lower bound on the learning rate (default: 0.0)
-  --lr_warmup_epochs LR_WARMUP_EPOCHS
-                        Number of warmup epochs for the learning rate scheduler (default: 5)
+```
+
+#### Regularization parameters
+
+```bash
+  --weight_decay WEIGHT_DECAY
+                        Weight decay for the optimizer (default: 5e-4)
+  --data_augmentation   Apply data augmentation during training (default: False)
 ```
 
 ### Evaluate a model
@@ -144,13 +159,11 @@ Options:
 
 ```bash  
   -h, --help            show this help message and exit
-  --input_size INPUT_SIZE
-                        Image spatial resolution (default: 48).
   --device {cuda,cpu}   Device to use for evaluation (default: cuda if available, otherwise cpu).
   --split {Test,Val,Train}
                         Data split to evaluate on (default: Test).
-  --state_dict_path STATE_DICT_PATH
-                        Path to state dict with weights (.pth).
+  --state_dict_dir STATE_DICT_DIR
+                        Path from /output/ to dir containing the state dict with weights (.pth).
 ```
 
 ### Plot a loss curve
@@ -176,79 +189,22 @@ Runs Hyperparameter Optimization with Optuna on desired model and dataset.
 python -m src.training.optuna_search
 ```
 
-Options:
+#### Study definition parameters
 
 ```bash
-  -h, --help            show this help message and exit
-  --seed SEED           Random seed for reproducibility (default: 42)
-  --dataset {fer,caers,afew,emotic,emotic-child,heco}
-                        Dataset to use for training and evaluation (default: fer)
-  --input_size INPUT_SIZE
-                        Image spatial resolution (default: 112)
-  --num_workers NUM_WORKERS
-                        DataLoader subprocess workers (default: 4)
-  --early_stopping_patience EARLY_STOPPING_PATIENCE
-                        Number of epochs with no improvement after which training will be stopped (default: 20)
-  --output_dir OUTPUT_DIR
-                        Directory to save logs and model checkpoints (default: ./output)
-  --batch_size BATCH_SIZE
-                        Batch size for training (default: 32)
-  --epochs EPOCHS       Number of training epochs (default: 100)
-  --head_lr HEAD_LR     Learning rate for the optimizer head (default: 1e-4)
-  --backbone_lr BACKBONE_LR
-                        Learning rate for the optimizer backbone (default: 1.0)
-  --unfreeze_epoch UNFREEZE_EPOCH
-                        Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)
-  --weight_decay WEIGHT_DECAY
-                        Weight decay for the optimizer (default: 5e-4)
-  --model {vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,efficientnet,mobilenet,mobilefacenet}
-                        Model architecture to use (default: vgg16)
-  --pretrained          Use pre-trained weights (default: False)
-  --weights_source {imagenet,custom}
-                        Source of pre-trained weights (default: imagenet)
-  --freezed             Freeze the convolutional layers of the model (default: False)
-  --dropout_rate DROPOUT_RATE
-                        Dropout rate for the regression head (default: 0.5)
-  --optimizer {adam,sgd,adamw}
-                        Optimizer to use for training (default: sgd)
-  --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
-  --data_augmentation   Apply data augmentation during training (default: False)
-  --use_amp             Use Automatic Mixed Precision (AMP) training (default: True)
-  --resume              Resume training from a previous checkpoint (default: False)
-  --no_checkpoint       Do not save checkpoints (default: False)
-  --no_model_save       Do not save the model (default: False)
-  --criterion {mse,ccc,combined}
-                        Loss function to use for training (default: mse)
-  --VAD_weights VAD_WEIGHTS
-                        Weights for the VAD loss (default: "1.0, 1.0, 1.0")
-  --orth_loss_weight ORTH_LOSS_WEIGHT
-                        Weight for the orthogonal loss (default: 0.5)
-  --ccc_weight CCC_WEIGHT
-                        Weight for the CCC loss (default: 0.5)
-  --scheduler {reduce_on_plateau,cosine_annealing}
-                        Learning rate scheduler to use (default: reduce_on_plateau)
-  --lr_factor LR_FACTOR
-                        Factor by which the learning rate will be reduced (default: 0.1)
-  --lr_patience LR_PATIENCE
-                        Number of epochs with no improvement after which the learning rate will be reduced (default: 10)
-  --lr_threshold LR_THRESHOLD
-                        Minimum change in the monitored quantity to qualify as an improvement (default: 1e-4)
-  --lr_threshold_mode LR_THRESHOLD_MODE
-                        Mode to compare the monitored quantity to the threshold (default: rel)
-  --lr_cooldown LR_COOLDOWN
-                        Number of epochs to wait before resuming normal operation after a reduction in the learning rate (default: 0)
-  --lr_min LR_MIN       Lower bound on the learning rate (default: 0.0)
-  --lr_warmup_epochs LR_WARMUP_EPOCHS
-                        Number of warmup epochs for the learning rate scheduler (default: 5)
-  --n_trials N_TRIALS   Number of Optuna trials
-  --optuna_seed OPTUNA_SEED
-                        Random seed for reproducibility
   --study_name STUDY_NAME
   --storage STORAGE
   --log_dir LOG_DIR
   --resume_study        Resume an existing Optuna study if it exists
   --pruner {hyperband,median,none}
                         Pruner type for Optuna trials
+```
+
+#### Training parameter ranges
+
+```bash
+  --range_dataset RANGE_DATASET
+                        Datasets to search over
   --range_model RANGE_MODEL
                         Backbone model options
   --range_head_lr RANGE_HEAD_LR
@@ -273,16 +229,74 @@ Options:
                         Criterions to search over
   --range_ccc_weight RANGE_CCC_WEIGHT
                         'Min, Max, Step' for CCC loss weight
-  --range_orth_loss_weight RANGE_ORTH_LOSS_WEIGHT
-                        'Min, Max, Step' for orth loss weight
   --range_scheduler RANGE_SCHEDULER
                         Schedulers to search over
   --range_lr_factor RANGE_LR_FACTOR
                         Discrete learning rate decay factors
   --range_lr_patience RANGE_LR_PATIENCE
                         'Min, Max' bounds for scheduler patience
-  --range_lr_warmup_epochs RANGE_SCHEDULER_WARMUP_EPOCHS
+  --range_lr_warmup_epochs RANGE_LR_WARMUP_EPOCHS
                         'Min, Max' bounds for warmup epochs
+```
+
+#### Arguments for fixing specific training parameters
+
+```bash
+  --output_dir OUTPUT_DIR
+                        Directory to save logs and checkpoints (default: outputs)
+  --seed SEED           Random seed for reproducibility (default: 42)
+  --device {cuda,cpu}   Device to use for training (default: cuda if available, otherwise cpu)
+  --resume              Resume training from a previous checkpoint (default: False)
+  --no_model_save       Do not save the model (default: False)
+  --num_workers NUM_WORKERS
+                        DataLoader subprocess workers (default: 4)
+  --use_amp             Use Automatic Mixed Precision (AMP) training (default: True)
+  --early_stopping_patience EARLY_STOPPING_PATIENCE
+                        Number of epochs with no improvement after which training will be stopped (default: 20)
+  --epochs EPOCHS       Number of training epochs (default: 100)
+
+  --dataset {fer,caers,afew,emotic,emotic-child,heco}
+                        Dataset to use for training and evaluation (default: fer)
+  --input_size INPUT_SIZE
+                        Image spatial resolution (default: 112)
+  --batch_size BATCH_SIZE
+                        Batch size for training (default: 32)
+
+  --model {vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,efficientnet,mobilenet,mobilefacenet}
+  --pretrained          Use pre-trained weights (default: False)
+  --weights_source {imagenet,custom}
+                        Source of pre-trained weights (default: imagenet)
+  --freezed             Freeze the convolutional layers of the model (default: False)
+                        Model architecture to use (default: vgg16)
+  --unfreeze_epoch UNFREEZE_EPOCH
+  --head_lr HEAD_LR     Learning rate for the optimizer head (default: 1e-4)
+  --backbone_lr BACKBONE_LR
+                        Learning rate for the optimizer backbone (default: 1.0)
+                        Epoch at which to unfreeze frozen backbone (-1 disables mid-training unfreeze)
+  --dropout_rate DROPOUT_RATE
+                        Dropout rate for the regression head (default: 0.5)
+
+  --criterion {mse,ccc,combined}
+                        Loss function to use for training (default: mse)
+  --VAD_weights VAD_WEIGHTS
+                        Weights for the VAD loss (default: "1.0, 1.0, 1.0")
+  --ccc_weight CCC_WEIGHT
+  --optimizer {adam,sgd,adamw}
+                        Optimizer to use for training (default: sgd)
+  --max_grad_norm MAX_GRAD_NORM
+                        Maximum norm for gradient clipping (default: 1.0, set 0 to disable)
+
+                        Weight for the CCC loss (default: 0.5)
+  --scheduler {reduce_on_plateau,cosine_annealing}
+                        Learning rate scheduler to use (default: reduce_on_plateau)
+  --lr_factor LR_FACTOR
+                        Factor by which the learning rate will be reduced (default: 0.1)
+  --lr_patience LR_PATIENCE
+                        Number of epochs with no improvement after which the learning rate will be reduced (default: 10)
+
+  --weight_decay WEIGHT_DECAY
+                        Weight decay for the optimizer (default: 5e-4)
+  --data_augmentation   Apply data augmentation during training (default: False)
 ```
 
 ### Analyze HPO results
@@ -309,6 +323,7 @@ Options:
                         Directory to search if csv_path is not specified
   --top_k TOP_K         Number of top trials to display
   --save                Save text report of the analysis output
+  --plot                Generate interactive CCC vs RMSE plot and save as HTML
   --output_dir OUTPUT_DIR
                         Directory where saved report files are stored
 ```

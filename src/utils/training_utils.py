@@ -1,23 +1,21 @@
-import numpy as np
-import argparse
-import random
-import os
-import re
-import numpy as np
-from typing import Optional, Tuple
+"""Training utility module providing model loading, loss criteria, and metrics."""
 
-import onnx2pytorch
-import onnx
+import random
+import re
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import onnx
+import onnx2pytorch
 import torchvision.models as tv_models
-from torch.nn import functional as F
 from torchvision.transforms import v2 as transforms
 
-from models import resnet, vgg, mobilenet, mobilefacenet, efficientnet
+from models import efficientnet, mobilefacenet, mobilenet, resnet, vgg
+from src.utils.parsing_utils import get_project_root
 
-
-# Navigate UP 3 levels: training -> src -> Age_Estimation
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 def set_seed(seed: int) -> None:
     """Seed Python, NumPy, PyTorch, and cuDNN for reproducible training."""
@@ -31,30 +29,61 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def assert_finite(name: str, tensor: torch.Tensor) -> None:
-    if not torch.isfinite(tensor).all():
-        raise FloatingPointError(
-            f"{name} contains NaN/Inf "
-            f"(min={tensor.nan_to_num().min().item()}, "
-            f"max={tensor.nan_to_num().max().item()})"
-        )
-
-
-def set_backbone_trainable(model: torch.nn.Module, trainable: bool) -> None:
-    """Freeze or unfreeze backbone parameters."""
+def set_backbone_trainable(model: nn.Module, trainable: bool) -> None:
+    """Sets gradient computation status for backbone model layers."""
     if hasattr(model, "backbone"):
-        for p in model.backbone.parameters():
-            p.requires_grad = trainable
+        for param in model.backbone.parameters():
+            param.requires_grad = trainable
     else:
         for name, param in model.named_parameters():
             if "head" not in name.lower():
                 param.requires_grad = trainable
 
 
+def get_parameter_groups(
+        model: torch.nn.Module, 
+        head_lr: float, 
+        backbone_lr: float, 
+        weight_decay: float
+    ) -> List[dict]:
+    """
+    Constructs optimizer parameter groups for differential learning rates.
+    
+    Args:
+        model: PyTorch model instance.
+        head_lr: Learning rate for the model's head.
+        backbone_lr: Learning rate for the model's backbone.
+        weight_decay: Weight decay for regularization.
+    Returns:
+        List of parameter groups for the optimizer.
+    """
+    if hasattr(model, "head") and hasattr(model, "backbone"):
+        head_params = list(model.head.parameters())
+        backbone_params = list(model.backbone.parameters())
+    else:
+        head_params = [p for n, p in model.named_parameters() if "head" in n.lower()]
+        backbone_params = [p for n, p in model.named_parameters() if "head" not in n.lower()]
+
+    return [
+        {"params": head_params, "lr": head_lr, "weight_decay": weight_decay, "name": "head"},
+        {"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay, "name": "backbone"}
+    ]
 
 
-def get_transforms(image_mean: list, image_std: list, input_size: int = 224, data_augmentation: bool = False):
-    """Build train and validation image transform pipelines."""
+def get_transforms(
+        image_mean: list, image_std: list, input_size: int = 224, data_augmentation: bool = False
+    ) -> Tuple[transforms.Compose, transforms.Compose]:
+    """
+    Build train and validation image transform pipelines.
+    
+    Args:
+        image_mean: Mean values for image normalization.
+        image_std: Standard deviation values for image normalization.
+        input_size: Size of the input images.
+        data_augmentation: Whether to apply data augmentation.
+    Returns:
+        Tuple of train and validation image transform pipelines.
+    """
     val_transform = transforms.Compose([
         transforms.Resize((input_size, input_size)),
         transforms.ToImage(),
@@ -65,9 +94,9 @@ def get_transforms(image_mean: list, image_std: list, input_size: int = 224, dat
     if not data_augmentation:
         return val_transform, val_transform
 
-    padding_size = int(input_size * 0.15)
+    pad = int(input_size * 0.15)
     train_transform = transforms.Compose([
-        transforms.Resize((input_size + padding_size, input_size + padding_size)),
+        transforms.Resize((input_size + pad, input_size + pad)),
         transforms.RandomCrop((input_size, input_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(degrees=(-10.0, 10.0)),
@@ -79,6 +108,209 @@ def get_transforms(image_mean: list, image_std: list, input_size: int = 224, dat
     ])
 
     return train_transform, val_transform
+
+
+class CCCLoss(nn.Module):
+    """Concordance Correlation Coefficient (CCC) Loss for regression tasks."""
+    def __init__(self, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = eps 
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute the CCC loss between predictions and targets."""
+        if preds.ndim == 1:
+            preds = preds.unsqueeze(1)
+        if targets.ndim == 1:
+            targets = targets.unsqueeze(1)
+
+        mean_preds, mean_targets = torch.mean(preds, dim=0), torch.mean(targets, dim=0)
+        var_preds, var_targets = torch.var(preds, dim=0, unbiased=False), torch.var(targets, dim=0, unbiased=False)
+
+        cov = torch.mean((preds - mean_preds) * (targets - mean_targets), dim=0)
+        ccc = (2.0 * cov) / torch.clamp(var_preds + var_targets + (mean_preds - mean_targets) ** 2 + 1e-8, min=1e-6)
+        return 1.0 - ccc 
+
+
+class VADLoss(nn.Module):
+    """Unified loss module supporting MSE, CCC, and Combined Losses."""
+
+    def __init__(self, criterion_type: str = "mse", weights: torch.Tensor = torch.tensor([1.0, 1.0, 1.0]), alpha: float = 0.5) -> None:
+        super().__init__()
+        self.criterion_type = criterion_type.lower()
+        self.alpha = alpha
+        self.mse = nn.MSELoss(reduction="none")
+        self.ccc = CCCLoss()
+        self.weights = weights
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the batch loss based on the specified criterion type.
+        
+        Args:
+            preds: Model predictions (batch_size x num_dimensions).
+            targets: Ground truth targets (batch_size x num_dimensions).
+        Returns:
+            Weighted loss scalar for the batch.
+        """
+        if self.criterion_type == "mse":
+            per_dim_loss = self.mse(preds, targets).mean(dim=0)  # Mean over the batch for each dimension
+        elif self.criterion_type == "ccc":
+            per_dim_loss = self.ccc(preds, targets)
+        elif self.criterion_type == "combined":
+            per_dim_mse_loss = self.mse(preds, targets).mean(dim=0)
+            per_dim_ccc_loss = self.ccc(preds, targets)
+            per_dim_loss = self.alpha * per_dim_ccc_loss + (1 - self.alpha) * per_dim_mse_loss
+        else:
+            raise ValueError(f"Unsupported criterion type: {self.criterion_type}. Choose from 'mse', 'ccc', or 'combined'.")
+
+        per_dim_loss = per_dim_loss.view(-1)
+        weights = self.weights.view(-1)
+        weighted_loss = torch.sum(per_dim_loss * weights, dim=0) / torch.sum(weights)
+        return weighted_loss
+
+
+def load_model(
+        model_name: str, 
+        num_channels: int = 3, 
+        num_outputs: int = 1, 
+        dropout_rate: float = 0.3, 
+        freezed: bool = False,
+        display: bool = True
+    ) -> torch.nn.Module:
+    """
+    Instantiate a model based on the specified architecture and parameters.
+
+    Args:
+        model_name: Name of the model to instantiate.
+        num_channels: Number of input channels.
+        num_outputs: Number of output dimensions.
+        dropout_rate: Dropout rate for the model.
+        freezed: Whether to freeze the model's parameters.
+        display: Whether to display model information.
+    Returns:
+        The instantiated model.
+    """
+    model_classes = {
+        "resnet": resnet.ResNetRegression,
+        "vgg": vgg.VGGRegression,
+        "mobilenet": mobilenet.MobileNet,
+        "mobilefacenet": mobilefacenet.MobileFaceNet,
+        "efficientnet": efficientnet.EfficientNetB0
+    }
+
+    base_name = re.findall(r'[a-zA-Z]+', model_name)[0].lower() if "resnet" in model_name or "vgg" in model_name else model_name.lower()
+    model_class = model_classes.get(base_name)
+
+    if model_class is None:
+        raise ValueError(f"Unsupported model architecture: {model_name}. Available options are: {list(model_classes.keys())}")
+
+    kwargs = {
+        "num_channels": num_channels,
+        "num_outputs": num_outputs,
+        "dropout_rate": dropout_rate,
+        "freezed": freezed,
+    }
+    if base_name in ["resnet", "vgg"]:
+        kwargs["model_name"] = model_name
+
+    model = model_class(**kwargs)
+
+    if display:
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Model: {model_name} - Trainable params: {trainable_params} / {total_params}")
+        if trainable_params == 0:
+            print("WARNING: No trainable parameters! Check model freezing logic.")
+
+    return model
+
+
+def load_pretrained_weights(
+        model: torch.nn.Module, 
+        model_name: str, 
+        weights_source: str = "imagenet",
+        display: bool = True
+    ) -> Tuple[torch.nn.Module, Optional[str]]:
+    """
+    Loads pre-trained weights into the target model architecture.
+    
+    Args:
+        model: The target PyTorch model instance.
+        model_name: Name of the model architecture.
+        weights_source: Source of the weights ('imagenet' or 'custom').
+        display: Whether to print loading information.
+    Returns:
+        Tuple of (model with loaded weights, source of weights or None).
+    """
+    if weights_source == "imagenet":
+        if model_name == "efficientnet":
+            tv_model_name = "efficientnet_b0"
+        elif model_name == "mobilenet":
+            tv_model_name = "mobilenet_v2"
+        else:
+            tv_model_name = model_name
+        try:
+            tv_model = tv_models.get_model(tv_model_name, weights="DEFAULT")
+            model.load_state_dict(tv_model.state_dict(), strict=False)
+            return model, "imagenet"
+        except Exception as e:
+            if display:
+                print(f"Error loading torchvision weights for {model_name}: {e}")
+            return model, "unknown"
+
+    elif weights_source == "custom":
+        # Load weights from the 'models/weights' directory, matching by model name
+        weights_dir = get_project_root() / "models" / "weights"
+        if not weights_dir.exists():
+            if display:
+                print(f"Warning: Weights folder '{weights_dir}' does not exist. Skipping weight loading.")
+            return model, "unknown"
+
+        match_file = next((file for file in weights_dir.iterdir() if model_name.lower() in file.name.lower()), None)
+        if not match_file:
+            if display:
+                print(f"No pretrained weights found for model: {model_name}")
+            return model, "unknown"
+
+        # Determine the file extension and load accordingly
+        extension = match_file.suffix.lower()
+        if extension in [".pth", ".pt"]:
+            raw_state_dict = torch.load(match_file, map_location=torch.device('cpu'))
+        elif extension == ".onnx":
+            onnx_model = onnx.load(match_file)
+            pytorch_model = onnx2pytorch.ConvertModel(onnx_model)
+            raw_state_dict = pytorch_model.state_dict()
+        else:
+            raise ValueError(f"Unsupported weight file format: {extension}")
+
+        if raw_state_dict is None or not isinstance(raw_state_dict, dict):
+            if display:
+                print(f"Warning: No valid state_dict found in {match_file}. Skipping weight loading.")
+            return model, "unknown"
+
+        # Handle common nested keys in state_dicts (e.g., 'state_dict', 'model', 'net')
+        for key in ["state_dict", "model", "net"]:
+            if key in raw_state_dict and isinstance(raw_state_dict[key], dict):
+                raw_state_dict = raw_state_dict[key]
+                break
+
+        # Match and load compatible weights into the model
+        matched_dict = _match_model_state_dict(model, raw_state_dict)
+        if not matched_dict:
+            if display:
+                print(f"Warning: No compatible weight keys matched for model '{model_name}' in '{match_file}'.")
+            return model, "unknown"
+
+        model_dict = model.state_dict()
+        model_dict.update(matched_dict)
+        model.load_state_dict(model_dict, strict=False)
+
+        if display:
+            print(f"Successfully loaded {len(matched_dict)}/{len(model_dict)} layers from {match_file} for model: {model_name}")
+            
+    else:
+        raise ValueError(f"Unsupported weights source: {weights_source}. Choose 'imagenet' or 'custom'.")
+    return model, "unknown"
 
 
 def _clean_onnx_prefix(key: str) -> str:
@@ -119,10 +351,13 @@ def _adapt_channel_weights(src_tensor: torch.Tensor, tgt_tensor: torch.Tensor) -
 
 def _match_model_state_dict(model: torch.nn.Module, raw_state_dict: dict) -> dict:
     """
-    Robustly maps checkpoint tensors to model parameters using:
-    1. Name-based and prefix-aware matching.
-    2. Automatic 3-channel to 1-channel input weight adaptation.
-    3. Unused-pool shape-based fallback matching.
+    Match and adapt keys from a raw state_dict to the target model's state_dict.
+
+    Args:
+        model: The target PyTorch model instance.
+        raw_state_dict: The source state_dict to match against.
+    Returns:
+        A dictionary of matched and adapted weights for the model.    
     """
     if not isinstance(raw_state_dict, dict):
         return {}
@@ -131,14 +366,13 @@ def _match_model_state_dict(model: torch.nn.Module, raw_state_dict: dict) -> dic
     matched = {}
     used_raw_keys = set()
 
-    # Pass 1: Name and prefix alignment
     for raw_key, src_tensor in raw_state_dict.items():
+        # Clean the raw key to remove common prefixes and ONNX graph paths
         clean_key = _clean_onnx_prefix(raw_key)
-
-        # Skip final regression/classification head weights
         if any(ignored in clean_key.lower() for ignored in ["head.", "fc.", "classifier.6", "output."]):
             continue
 
+        # Generate candidate keys to match against the model's state_dict
         candidates = [
             clean_key,
             f"backbone.{clean_key}",
@@ -156,7 +390,6 @@ def _match_model_state_dict(model: torch.nn.Module, raw_state_dict: dict) -> dic
                     used_raw_keys.add(raw_key)
                     break
 
-    # Pass 2: Unused-pool shape-based matching (Fixes index skip bug)
     unmatched_model_keys = [
         k for k in model_state.keys() 
         if k not in matched and not any(h in k for h in ["head.", "classifier.6"])
@@ -167,6 +400,7 @@ def _match_model_state_dict(model: torch.nn.Module, raw_state_dict: dict) -> dic
         if k not in used_raw_keys and not any(h in k.lower() for h in ["fc", "head", "output"])
     ]
 
+    # Try to match any remaining unmatched model keys with unused raw items
     for m_key in unmatched_model_keys:
         tgt_tensor = model_state[m_key]
         for r_key, src_tensor in unused_raw_items:
@@ -181,333 +415,12 @@ def _match_model_state_dict(model: torch.nn.Module, raw_state_dict: dict) -> dic
 
     return matched
 
-def load_pretrained_weights(
-        model: torch.nn.Module, 
-        model_name: str, 
-        weights_source: str = "imagenet",
-        display: bool = True
-    ) -> Tuple[torch.nn.Module, Optional[str]]:
-    """Load pretrained weights into the model, handling ONNX conversion and channel alignment."""
-    raw_state_dict = None
-    dataset_name = "unknown"
-    source_label = ""
-
-    if weights_source == "imagenet":
-        tv_name_map = {
-            "resnet18": "resnet18",
-            "resnet34": "resnet34",
-            "resnet50": "resnet50",
-            "vgg11": "vgg11",
-            "vgg13": "vgg13",
-            "vgg16": "vgg16",
-            "vgg19": "vgg19",
-            "efficientnet": "efficientnet_b0",
-            "mobilenet": "mobilenet_v2",
-        }
-        tv_arch = tv_name_map.get(model_name.lower(), model_name.lower())
-        try:
-            tv_model = tv_models.get_model(tv_arch, weights="DEFAULT")
-            raw_state_dict = tv_model.state_dict()
-            dataset_name = "imagenet"
-            source_label = "torchvision ImageNet weights"
-        except Exception as e:
-            if display:
-                print(f"Error loading torchvision weights for {model_name}: {e}")
-            return model, "unknown"
-
-    elif weights_source == "custom":
-        weights_folder = os.path.join(project_root, "models", "weights")
-        if not os.path.exists(weights_folder):
-            if display:
-                print(f"Warning: Weights folder '{weights_folder}' does not exist. Skipping weight loading.")
-            return model, "unknown"
-
-        weights_list = os.listdir(weights_folder)
-        weight_file = next((file for file in weights_list if model_name.lower() in file.lower()), None)
-
-        if weight_file is None:
-            if display:
-                print(f"No pretrained weights found for model: {model_name}")
-            return model, "unknown"
-
-        file_path = os.path.join(weights_folder, weight_file)
-        source_label = f"custom weights from {file_path}"
-        file_name = os.path.basename(weight_file)
-        root, extension = os.path.splitext(file_name)
-
-        parts = root.split("_")
-        dataset_name = parts[1] if len(parts) > 1 else None
-
-        if extension in [".pth", ".pt"]:
-            raw_state_dict = torch.load(file_path, map_location=torch.device('cpu'))
-        elif extension == ".onnx":
-            onnx_model = onnx.load(file_path)
-            pytorch_model = onnx2pytorch.ConvertModel(onnx_model)
-            raw_state_dict = pytorch_model.state_dict()
-        else:
-            raise ValueError(f"Unsupported weight file format: {extension}")
-
-    else:
-        raise ValueError(f"Unsupported weights source: {weights_source}. Choose 'imagenet' or 'custom'.")
-
-    if raw_state_dict is None or not isinstance(raw_state_dict, dict):
-        if display:
-            print(f"Warning: No valid state_dict found in {source_label}. Skipping weight loading.")
-        return model, dataset_name
-
-    # Unnest state dict wrappers if nested
-    for key in ["state_dict", "model", "net"]:
-        if key in raw_state_dict and isinstance(raw_state_dict[key], dict):
-            raw_state_dict = raw_state_dict[key]
-            break
-
-    # Use the robust state dict matching function
-    matched_dict = _match_model_state_dict(model, raw_state_dict)
-
-    if not matched_dict:
-        if display:
-            print(f"Warning: No compatible weight keys matched for model '{model_name}' in '{source_label}'.")
-        return model, dataset_name
-
-    model_dict = model.state_dict()
-    model_dict.update(matched_dict)
-    model.load_state_dict(model_dict, strict=False)
-
-    if display:
-        print(f"Successfully loaded {len(matched_dict)}/{len(model_dict)} layers from {source_label} for model: {model_name}")
-        
-    return model, dataset_name
-
-
-def load_model(
-        model_name: str, 
-        num_channels: int = 3, 
-        num_outputs: int = 1, 
-        dropout_rate: float = 0.3, 
-        freezed: bool = False,
-        display: bool = True
-    ) -> torch.nn.Module:
-    """Instantiate a model based on the specified architecture and parameters."""
-    MODEL_CLASSES = {
-        "resnet": resnet.ResNetRegression,
-        "vgg": vgg.VGGRegression,
-        "mobilenet": mobilenet.MobileNet,
-        "mobilefacenet": mobilefacenet.MobileFaceNet,
-        "efficientnet": efficientnet.EfficientNetB0
-    }
-
-    base_name = re.findall(r'[a-zA-Z]+', model_name)[0].lower() if "resnet" in model_name or "vgg" in model_name else model_name.lower()
-    model_class = MODEL_CLASSES.get(base_name)
-
-    if model_class is None:
-        raise ValueError(f"Unsupported model architecture: {model_name}. Available options are: {list(MODEL_CLASSES.keys())}")
-
-    if base_name in ["resnet", "vgg"]:
-        model = model_class(
-            model_name=model_name, 
-            num_channels=num_channels, 
-            num_outputs=num_outputs, 
-            dropout_rate=dropout_rate, 
-            freezed=freezed
-        )
-    else:
-        model = model_class(
-            num_channels=num_channels, 
-            num_outputs=num_outputs, 
-            dropout_rate=dropout_rate, 
-            freezed=freezed
-        )
-
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    
-    if display:
-        print(f"Model: {model_name} - Trainable params: {trainable_params} / {total_params}")
-        if trainable_params == 0:
-            print("WARNING: No trainable parameters! Check model freezing logic.")
-
-    return model
-
-    
-def orth_dist(weight: torch.Tensor) -> torch.Tensor:
-    """
-    Computes soft orthogonality loss across matrix/tensor dimensions:
-    Loss = || W W^T - I ||_F^2 (or || W^T W - I ||_F^2 depending on matrix shape).
-    """
-    if weight.dim() == 4: # Convolutional layer weights
-        w_flat = weight.view(weight.size(0), -1)  # Flatten to (out_channels, in_channels * kernel_height * kernel_width)
-    elif weight.dim() == 2: # Fully connected layer weights
-        w_flat = weight  # Already in the correct shape
-    else:
-        return torch.tensor(0.0, device=weight.device)  # No orthogonality loss for other dimensions
-
-    rows, cols = w_flat.size()
-    if rows <= cols:
-        gram = torch.mm(w_flat, w_flat.t())
-        identity = torch.eye(rows, device=weight.device)
-    else:
-        gram = torch.mm(w_flat.t(), w_flat)
-        identity = torch.eye(cols, device=weight.device)
-
-    return torch.norm(gram - identity, p='fro')  # Frobenius norm of the difference
-
-
-def conv_orth_loss(layer: torch.nn.Conv2d) -> torch.Tensor:
-    """
-    Computes orthogonality loss for a convolutional layer by enforcing spatial orthogonality.
-    This is done by convolving the kernel with itself and comparing it to a Dirac delta function.
-    Loss = || Conv(K, K, padding=P, stride=S) - I ||_F^2
-    """
-    kernel = layer.weight
-    c_out, c_in, h, w = kernel.shape
-
-    if c_out != c_in or h != w:
-        return orth_dist(kernel)  # Fallback to standard orthogonality loss if not square
-
-    try:
-        conv_output = F.conv2d(kernel, kernel, stride=layer.stride, padding=layer.padding)
-        h_out, w_out = conv_output.shape[-2:]
-
-        target = torch.zeros_like(conv_output)
-        cy, cx = h_out // 2, w_out // 2
-        target[:, :, cy, cx] = torch.eye(c_out, device=kernel.device)
-
-        return torch.sum((conv_output - target) ** 2)  # Frobenius norm of the difference || Conv(K, K, padding=P, stride=S) - I ||_F^2
-
-    except RuntimeError:
-        return orth_dist(kernel)  # Fallback to standard orthogonality loss if convolution fails
-
-
-def compute_orth_loss_model(model: torch.nn.Module) -> torch.Tensor:
-    """
-    Generalized function to compute orthogonality loss for all convolutional and linear layers in a model.
-    This function iterates through the model's parameters, identifies convolutional and linear layers,
-    and computes the orthogonality loss for each layer. The total loss is the sum of individual losses.
-    """
-    loss = torch.tensor(0.0, device=next(model.parameters()).device)  # Initialize loss on the same device as model parameters
-    count = 0  # Counter for the number of layers contributing to the loss
-
-    for module in model.modules():
-        if isinstance(module, torch.nn.Conv2d) and module.weight.requires_grad:
-            loss += conv_orth_loss(module)
-            count += 1
-        elif isinstance(module, torch.nn.Linear) and module.weight.requires_grad:
-            loss += orth_dist(module.weight)
-            count += 1
-
-    return loss / max(count, 1)  # Return average loss to avoid division by zero
-
-
-def compute_weighted_loss(
-        outputs: torch.Tensor, 
-        targets: torch.Tensor, 
-        weights: torch.Tensor, 
-        criterion: torch.nn.Module
-    ) -> torch.Tensor:
-    """Compute the weighted across active dimensions."""
-    loss_per_dim = criterion(outputs, targets)
-    normalized_weights = weights / weights.sum()
-    weighted_loss = loss_per_dim * normalized_weights
-    return weighted_loss.sum(dim=1).mean()
-
-
-def compute_batch_loss(
-        outputs: torch.Tensor, 
-        targets: torch.Tensor, 
-        weights: torch.Tensor, 
-        criterion_type: str = "mse",
-        alpha: float = 0.5
-    ) -> torch.Tensor:
-    """Compute the batch loss based on the specified criterion type."""
-    mse_criterion: torch.nn.Module = torch.nn.MSELoss(reduction='none')
-    ccc_criterion: torch.nn.Module = CCCLoss()
-
-    if criterion_type == "mse":
-        per_dim_loss = mse_criterion(outputs, targets).mean(dim=0)  # Mean over the batch for each dimension
-    elif criterion_type == "ccc":
-        per_dim_loss = ccc_criterion(outputs, targets)
-    elif criterion_type == "combined":
-        per_dim_mse_loss = mse_criterion(outputs, targets).mean(dim=0)
-        per_dim_ccc_loss = ccc_criterion(outputs, targets)
-        per_dim_loss = alpha * per_dim_ccc_loss + (1 - alpha) * per_dim_mse_loss
-    else:
-        raise ValueError(f"Unsupported criterion type: {criterion_type}. Choose from 'mse', 'ccc', or 'combined'.")
-
-    per_dim_loss = per_dim_loss.view(-1)  # Ensure per_dim_loss is a 1D tensor
-    weights = weights.view(-1)  # Ensure weights is a 1D tensor
-
-    weighted_loss = torch.sum(per_dim_loss * weights, dim=0) / torch.sum(weights)
-    return weighted_loss
-
-
-def compute_metrics(preds: torch.Tensor, targets: torch.Tensor) -> dict:
-    """Calculate overall and per-dimension MSE, RMSE, CCC, and Pred StdDev."""
-    preds = preds.detach().cpu().float()
-    targets = targets.detach().cpu().float()
-    num_dims = preds.shape[1]
-
-    # Per-dimension MSE and RMSE
-    mse_per_dim = torch.mean((preds - targets) ** 2, dim=0).numpy()
-    rmse_per_dim = np.sqrt(mse_per_dim)
-
-    # Per-dimension CCC
-    ccc_per_dim = []
-    for i in range(num_dims):
-        p, t = preds[:, i], targets[:, i]
-        p_mean, t_mean = torch.mean(p), torch.mean(t)
-        p_var, t_var = torch.var(p, unbiased=False) + 1e-7, torch.var(t, unbiased=False) + 1e-7
-        cov = torch.mean((p - p_mean) * (t - t_mean))
-        ccc = (2 * cov) / (p_var + t_var + (p_mean - t_mean) ** 2 + 1e-7)
-        ccc_per_dim.append(ccc.item())
-
-    pred_std = torch.std(preds, dim=0)
-
-    return {
-        "mse_overall": float(np.mean(mse_per_dim)),
-        "rmse_overall": float(np.mean(rmse_per_dim)),
-        "ccc_overall": float(np.mean(ccc_per_dim)),
-        "mse_per_dim": list(map(float, mse_per_dim)),
-        "rmse_per_dim": list(map(float, rmse_per_dim)),
-        "ccc_per_dim": list(map(float, ccc_per_dim)),
-        "pred_std": list(map(float, pred_std)),
-    }
-
-
-class CCCLoss(torch.nn.Module):
-    """Concordance Correlation Coefficient (CCC) Loss for regression tasks."""
-    def __init__(self, eps = 1e-8):
-        super().__init__()
-        self.eps = eps  # Small epsilon to avoid division by zero
-
-    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Compute the CCC loss between predictions and targets."""
-        if preds.ndim == 1:
-            preds = preds.unsqueeze(1)
-        if targets.ndim == 1:
-            targets = targets.unsqueeze(1)
-
-        mean_preds = torch.mean(preds, dim=0)
-        mean_targets = torch.mean(targets, dim=0)
-
-        var_preds = torch.var(preds, dim=0, unbiased=False)
-        var_targets = torch.var(targets, dim=0, unbiased=False)
-
-        covariance = torch.mean((preds - mean_preds) * (targets - mean_targets), dim=0)
-
-        ccc = (2.0 * covariance) / torch.clamp(var_preds + var_targets + (mean_preds - mean_targets) ** 2 + 1e-8, min=1e-6)
-        return 1.0 - ccc  # Return 1 - CCC as the loss to minimize
-
 
 def apply_mixup(inputs: torch.Tensor, targets: torch.Tensor, alpha: float = 0.2):
     """Applies Mixup interpolation to input images and VAD targets."""
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1.0
-
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     batch_size = inputs.size(0)
     index = torch.randperm(batch_size).to(inputs.device)
-
     mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
     mixed_targets = lam * targets + (1 - lam) * targets[index]
     

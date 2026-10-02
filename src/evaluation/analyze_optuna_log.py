@@ -1,36 +1,60 @@
+"""Optuna trial log analysis, statistical importance testing, and interactive reporting."""
+
 import argparse
 import ast
+from io import StringIO
 from pathlib import Path
 import re
-from io import StringIO
 import sys
-import pandas as pd
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 from scipy import stats
 from scipy.spatial.distance import pdist, squareform
-import plotly.graph_objects as go
 
 
-class Tee:
+class TeeOutput:
     """Helper class to write output simultaneously to stdout and a report file."""
-    def __init__(self, filepath: Path):
-        self.file = open(filepath, "w", encoding="utf-8")
+    def __init__(self, filepath: Optional[Path]):
+        self.filepath = filepath
+        self.file = None
         self.stdout = sys.stdout
 
-    def write(self, data):
+    def __enter__(self):
+        if self.filepath:
+            self.filepath.parent.mkdir(parents=True, exist_ok=True)
+            self.file = open(self.filepath, "w", encoding="utf-8")
+            sys.stdout = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.file:
+            sys.stdout = self.stdout
+            self.file.close()
+
+    def write(self, data: str) -> None:
         self.stdout.write(data)
-        self.file.write(data)
+        if self.file:
+            self.file.write(data)
 
-    def flush(self):
+    def flush(self) -> None:
         self.stdout.flush()
-        self.file.flush()
+        if self.file:
+            self.file.flush()
 
-    def close(self):
-        self.file.close()
 
 
 def discover_optuna_csvs(search_dir: Path) -> list[Path]:
-    """Recursively find all Optuna trial CSV files in subdirectories, sorted by modification time (latest first)."""
+    """
+    Recursively find all Optuna trial CSV files in subdirectories, sorted by modification time (latest first)
+    
+    Args:
+        search_dir: Directory to search for CSV files.
+    Returns:
+        List of discovered CSV file paths.
+    """
     if not search_dir.exists():
         return []
     
@@ -43,16 +67,16 @@ def discover_optuna_csvs(search_dir: Path) -> list[Path]:
 
 
 def parse_and_normalize_vad(df: pd.DataFrame) -> pd.DataFrame:
-    """Detects VAD weight parameters, creates a single 'VAD_weights_normalized' column formatted as [V, A, D],
-    and stores internal normalized vector values (_vad_pV, _vad_pA, _vad_pD) for joint PERMANOVA analysis.
     """
-    vad_col_name = None
-    for col in df.columns:
-        if "vad" in col.lower() and "weight" in col.lower():
-            vad_col_name = col
-            break
+    Detects VAD weight parameters and stores normalized proportion vectors (_vad_pV, _vad_pA, _vad_pD).
+    
+    Args:
+        df: DataFrame containing trial logs with potential VAD weight columns.
+    Returns:
+        DataFrame with additional normalized VAD weight columns.
+    """
+    vad_col_name = next((col for col in df.columns if "vad" in col.lower() and "weight" in col.lower()), None)
 
-    # Parse stringified vector/list columns (e.g., "[1.0, 0.5, 0.2]")
     if vad_col_name and df[vad_col_name].dtype == object:
         def extract_norm(val):
             if pd.isna(val):
@@ -80,7 +104,6 @@ def parse_and_normalize_vad(df: pd.DataFrame) -> pd.DataFrame:
         df["_vad_pA"] = parsed_series.apply(lambda x: x[1] if x is not None else np.nan)
         df["_vad_pD"] = parsed_series.apply(lambda x: x[2] if x is not None else np.nan)
 
-    # Fallback: Parse individual weight_v, weight_a, weight_d columns if present
     elif all(c in df.columns for c in ["weight_v", "weight_a", "weight_d"]):
         total = df["weight_v"] + df["weight_a"] + df["weight_d"]
         pV = df["weight_v"] / total
@@ -100,15 +123,16 @@ def parse_and_normalize_vad(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def determine_primary_metric(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-    """Identifies the primary loss/metric column in order of priority:
-    'rmse_overall', 'mean_rmse', 'val_loss'. Creates a unified '_primary_metric' column.
     """
-    priority = ["rmse_overall", "mean_rmse", "val_loss"]
-    chosen_metric = None
-    for candidate in priority:
-        if candidate in df.columns and df[candidate].dropna().count() > 0:
-            chosen_metric = candidate
-            break
+    Identifies primary loss/metric column in order of priority: rmse_overall, mean_rmse, val_loss.
+
+    Args:
+        df: DataFrame containing trial logs with various metrics.
+    Returns:
+        Tuple of (DataFrame with '_primary_metric' column, name of chosen primary metric).
+    """
+    priority = ["val_loss", "rmse_overall", "mse_overall", "ccc_overall"]
+    chosen_metric = next((c for c in priority if c in df.columns and df[c].dropna().count() > 0), None)
 
     if chosen_metric is None:
         numeric_cols = df.select_dtypes(include=[np.number]).columns
@@ -118,26 +142,23 @@ def determine_primary_metric(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     return df, chosen_metric
 
 
-
 def load_and_clean_data(csv_path: Path) -> tuple[pd.DataFrame, str]:
-    """Loads CSV log with automatic repair for unquoted bracketed lists and inconsistent field counts."""
+    """
+    Loads CSV log with automatic repair for unquoted bracketed lists and inconsistent field counts.
+    
+    Args:
+        csv_path: Path to the CSV log file.
+    Returns:
+        Tuple of (cleaned DataFrame, name of the primary metric).
+    """
     try:
         df = pd.read_csv(csv_path)
     except (pd.errors.ParserError, Exception):
         try:
             with open(csv_path, "r", encoding="utf-8") as f:
-                raw_lines = f.readlines()
+                sanitized_lines = [re.sub(r'(?<!")(\[[^\]]+\])(?!")', r'"\1"', line) for line in f]
 
-            sanitized_lines = []
-            for line in raw_lines:
-                fixed = re.sub(r'(?<!")(\[[^\]]+\])(?!")', r'"\1"', line)
-                sanitized_lines.append(fixed)
-
-            df = pd.read_csv(
-                StringIO("".join(sanitized_lines)),
-                engine="python",
-                on_bad_lines="skip"
-            )
+            df = pd.read_csv(StringIO("".join(sanitized_lines)), engine="python", on_bad_lines="skip")
             print(f"Notice: Auto-repaired CSV formatting issues (unquoted lists/commas) in '{csv_path.name}'.")
         except Exception:
             df = pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
@@ -150,19 +171,18 @@ def load_and_clean_data(csv_path: Path) -> tuple[pd.DataFrame, str]:
         if col not in categorical_cols_set and not col.startswith("_vad_"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    for v_col, a_col, d_col in [
-        ("rmse_Valence", "rmse_Arousal", "rmse_Dominance"),
-        ("rmse_Valence", "rmse_Arousal", "rmse_Dominance")
-    ]:
+    loss_metrics = ["rmse", "mse", "ccc"]
+    for loss_metric in loss_metrics:
+        v_col, a_col, d_col = f"{loss_metric}_Valence", f"{loss_metric}_Arousal", f"{loss_metric}_Dominance"
         if v_col in df.columns and a_col in df.columns:
             if d_col in df.columns:
-                df["rmse_VAD"] = df.apply(
+                df[f"{loss_metric}_VAD"] = df.apply(
                     lambda r: f"{format_num(r[v_col])}; {format_num(r[a_col])}; {format_num(r[d_col])}"
                     if pd.notna(r[v_col]) else "N/A",
                     axis=1
                 )
             else:
-                df["rmse_VAD"] = df.apply(
+                df[f"{loss_metric}_VAD"] = df.apply(
                     lambda r: f"{format_num(r[v_col])}; {format_num(r[a_col])}"
                     if pd.notna(r[v_col]) else "N/A",
                     axis=1
@@ -177,7 +197,8 @@ def get_parameter_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     """Includes all parameter columns that vary across trials, excluding fixed or non-informative columns. Returns two lists: categorical and numeric parameters."""
     exclude_prefixes = ("_vad_", "mse_", "rmse_", "ccc_", "pred_std_", "datetime_")
     exclude = {
-        "trial_num", "status", "duration_sec", "val_loss", "rmse_VAD",
+        "trial_num", "status", "duration_sec", 
+        "val_loss", "rmse_VAD", "mse_VAD", "ccc_VAD",
         "_primary_metric", "rank_score", "log_rank_score", "is_pruned", 
         "weight_v", "weight_a", "weight_d", "VAD_weights_normalized"
     }
@@ -189,9 +210,7 @@ def get_parameter_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     ]
     target_categoricals = ["model", "criterion", "optimizer", "input_size", "weights_source", "scheduler"]
 
-    cat_cols = []
-    num_cols = []
-
+    cat_cols, num_cols = [], []
     eval_df = df[df["status"].isin(["COMPLETE", "PRUNED"])] if "status" in df.columns else df
 
     for col in df.columns:
@@ -275,10 +294,10 @@ def extract_filename_params(csv_path: str) -> dict:
     return params
 
 
-def generate_best_run_command(csv_path: str, best_row: pd.Series) -> str:
+def generate_best_run_command(csv_path: Path, best_row: pd.Series) -> str:
     """Constructs the exact executable CLI command for the best trial."""
     cmd_args = ["python", "-m", "src.training.train"]
-    params = extract_filename_params(csv_path)
+    params = extract_filename_params(csv_path.name)
     
     known_args = [
         "dataset", "model", "input_size", "batch_size", "head_lr", "backbone_lr",
@@ -375,8 +394,7 @@ def print_categorical_table(df: pd.DataFrame, cat_cols: list):
     if not cat_cols:
         return
 
-    header  = "+-------------------+----------------+-------+-----------+-----------+-----------+------------+"
-    divider = "+-------------------+----------------+-------+-----------+-----------+-----------+------------+"
+    header = "+-------------------+----------------+-------+-----------+-----------+-----------+------------+"
     
     print("\n[ CATEGORICAL & DISCRETE PARAMETER SUMMARY ]")
     print(header)
@@ -404,7 +422,7 @@ def print_categorical_table(df: pd.DataFrame, cat_cols: list):
             
             print(f"| {param_name:<17} | {str(row[col]):<14} | {int(row['total']):<5} | {mean_str:<9} | {min_str:<9} | {std_str:<9} | {prune_str:<10} |")
         
-        print(divider)
+        print(header)
 
 
 def run_prune_propensity_test(df: pd.DataFrame, cat_cols: list, num_cols: list):
@@ -435,10 +453,7 @@ def run_prune_propensity_test(df: pd.DataFrame, cat_cols: list, num_cols: list):
                     highest_rate = prune_rates.max() * 100
 
                     results.append({
-                        "Parameter": col,
-                        "Type": "Categorical",
-                        "Prune Test": "Chi-Square",
-                        "p-value": p_val,
+                        "Parameter": col, "Type": "Categorical", "Prune Test": "Chi-Square", "p-value": p_val, 
                         "Prune Trigger Risk": f"Value '{worst_cat}' ({highest_rate:.0f}% pruned)"
                     })
 
@@ -456,11 +471,8 @@ def run_prune_propensity_test(df: pd.DataFrame, cat_cols: list, num_cols: list):
                 direction = "High values" if med_pruned > med_comp else ("Low values" if med_pruned < med_comp else "Equal median")
 
                 results.append({
-                    "Parameter": col,
-                    "Type": "Numeric",
-                    "Prune Test": "Mann-Whitney U",
-                    "p-value": p_val,
-                    "Prune Trigger Risk": f"{direction} (Med: {format_num(med_pruned)})"
+                    "Parameter": col, "Type": "Numeric", "Prune Test": "Mann-Whitney U",
+                    "p-value": p_val, "Prune Trigger Risk": f"{direction} (Med: {format_num(med_pruned)})"
                 })
 
     if not results:
@@ -494,21 +506,14 @@ def run_prune_propensity_test(df: pd.DataFrame, cat_cols: list, num_cols: list):
 def run_statistical_importance_test(df: pd.DataFrame, cat_cols: list, num_cols: list):
     """Statistical importance tests with penalized rank imputation for pruned runs."""
     print("\n[ STATISTICAL PARAMETER IMPORTANCE & RECOMMENDATIONS ]")
-    results = []
-
     eval_df = df[df["status"].isin(["COMPLETE", "PRUNED"])].copy()
-    if len(eval_df) < 3:
-        print("Not enough recorded trials to perform statistical significance tests.")
-        return
-
     completed_df = eval_df[eval_df["status"] == "COMPLETE"]
+
     if len(completed_df) == 0:
         print("No completed trials found to infer baseline metrics.")
         return
 
-    max_rmse = completed_df["_primary_metric"].max()
-    penalty_val = max_rmse * 1.2
-    
+    penalty_val = completed_df["_primary_metric"].max() * 1.2
     eval_df["rank_score"] = eval_df["_primary_metric"].fillna(penalty_val)
     eval_df["log_rank_score"] = np.log10(eval_df["rank_score"])
 
@@ -516,19 +521,16 @@ def run_statistical_importance_test(df: pd.DataFrame, cat_cols: list, num_cols: 
     top_df = completed_df.sort_values(by="_primary_metric", ascending=True).head(n_top)
     best_trial = completed_df.sort_values(by="_primary_metric", ascending=True).iloc[0]
 
+    results = []
     for col in cat_cols:
         if col in eval_df.columns and eval_df[col].nunique() > 1:
             groups = [group["log_rank_score"].values for _, group in eval_df.groupby(col)]
             _, p_val = stats.kruskal(*groups) if len(groups) > 1 else (0.0, 1.0)
-            
             top_choices = top_df[col].value_counts()
-            rec_val = str(top_choices.index[0]) if not top_choices.empty else "N/A"
 
             results.append({
-                "Parameter": col,
-                "Type": "Categorical",
-                "p-value": p_val,
-                "Recommended (Top 25%)": rec_val,
+                "Parameter": col, "Type": "Categorical", "p-value": p_val,
+                "Recommended (Top 25%)": str(top_choices.index[0]) if not top_choices.empty else "N/A",
                 "Best Trial (#1)": str(best_trial[col])
             })
 
@@ -537,16 +539,10 @@ def run_statistical_importance_test(df: pd.DataFrame, cat_cols: list, num_cols: 
             sub_df = eval_df.dropna(subset=[col, "log_rank_score"])
             if len(sub_df) > 2:
                 _, p_val = stats.spearmanr(sub_df[col], sub_df["log_rank_score"])
-                
                 min_v, max_v = top_df[col].min(), top_df[col].max()
                 rec_str = format_num(min_v) if min_v == max_v else f"[{format_num(min_v)} - {format_num(max_v)}]"
-
-                results.append({
-                    "Parameter": col,
-                    "Type": "Numeric",
-                    "p-value": p_val,
-                    "Recommended (Top 25%)": rec_str,
-                    "Best Trial (#1)": format_num(best_trial[col])
+                results.append({"Parameter": col, "Type": "Numeric", "p-value": p_val,
+                    "Recommended (Top 25%)": rec_str,  "Best Trial (#1)": format_num(best_trial[col])
                 })
 
     if not results:
@@ -579,16 +575,75 @@ def run_statistical_importance_test(df: pd.DataFrame, cat_cols: list, num_cols: 
     print(res_df.to_string(index=False))
 
 
+def plot_interactive_ccc_vs_rmse(df: pd.DataFrame, output_html: Path):
+    """ Generates an interactive Plotly scatter plot of CCC vs RMSE"""
+    valid_df = df.dropna(subset=['rmse_overall', 'ccc_overall']).copy()
+    if valid_df.empty:
+        print("No valid numeric data found for plotting.")
+        return
+
+    fig = go.Figure()
+    status_config = {
+        'COMPLETE': {'color': '#2ca02c', 'symbol': 'circle', 'name': 'COMPLETE'},
+        'PRUNED': {'color': '#ff7f0e', 'symbol': 'triangle-up', 'name': 'PRUNED'}
+    }
+
+    exclude_cols = {"trial_num", "status", "duration_sec", "val_loss"}
+    hp_cols = [
+        c for c in valid_df.columns 
+        if not c.startswith(("mse_", "rmse_", "ccc_", "pred_std_", "_")) and c not in exclude_cols
+    ]
+
+    for status, cfg in status_config.items():
+        sub_df = valid_df[valid_df['status'].astype(str).str.upper() == status]
+        if sub_df.empty:
+            continue
+
+        hover_texts = []
+        for _, row in sub_df.iterrows():
+            trial_id = int(row['trial_num']) if 'trial_num' in row and pd.notna(row['trial_num']) else row.name
+            card = [
+                f"<b>Trial #{trial_id}</b> ({status})",
+                f"<b>RMSE:</b> {row['rmse_overall']:.4f}",
+                f"<b>CCC:</b> {row['ccc_overall']:.4f}",
+                f"<b>Duration:</b> {row['duration_sec']:.2f} seconds"
+            ]
+            if 'val_loss' in row and pd.notna(row['val_loss']) and str(row['val_loss']) != 'N/A':
+                card.append(f"<b>Val Loss:</b> {row['val_loss']}")
+            card.append("")
+            card.append("<b>Hyperparameters:</b>")
+            for hp in hp_cols:
+                val = row[hp]
+                if pd.notna(val) and str(val) != 'N/A':
+                    card.append(f"• <i>{hp}:</i> {val}")
+            hover_texts.append("<br>".join(card))
+
+        fig.add_trace(go.Scatter(
+            x=sub_df['rmse_overall'], y=sub_df['ccc_overall'], mode='markers+text', name=cfg['name'],
+            text=[f"T{int(r['trial_num'])}" if 'trial_num' in r and pd.notna(r['trial_num']) else f"T{r.name}" for _, r in sub_df.iterrows()],
+            textposition="top center", textfont=dict(size=10), hoverinfo='text', hovertext=hover_texts,
+            marker=dict(size=12, color=cfg['color'], symbol=cfg['symbol'], line=dict(width=1, color='black'), opacity=0.85)
+        ))
+
+    fig.update_layout(
+        title=dict(text="Optuna Trial Evaluation: CCC vs. RMSE", font=dict(size=16, color="black")),
+        xaxis=dict(title="Overall RMSE (Lower is better)", gridcolor='#E5E5E5'),
+        yaxis=dict(title="Overall CCC (Higher is better)", gridcolor='#E5E5E5'),
+        template="plotly_white",
+        legend=dict(title="Trial Status", bordercolor="black", borderwidth=1),
+        hoverlabel=dict(bgcolor="white", font_size=12, font_family="Arial")
+    )
+
+    if output_html:
+        fig.write_html(output_html)
+        print(f"Interactive HTML report saved to '{output_html}'")
+
+
 def analyze_trials(csv_path: Path, top_k: int = 5, save: bool = False, plot: bool = False, output_dir: Path = Path("./output/optuna_logs")):
     """Executes full analysis and optionally logs output to file."""
-    tee = None
-    if save:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        report_path = output_dir / f"{csv_path.stem}_analysis.txt"
-        tee = Tee(report_path)
-        sys.stdout = tee
+    report_path = output_dir / f"{csv_path.stem}_analysis.txt" if save else None
 
-    try:
+    with TeeOutput(report_path):
         df, primary_metric_name = load_and_clean_data(csv_path)
 
         print("=" * 80)
@@ -597,44 +652,36 @@ def analyze_trials(csv_path: Path, top_k: int = 5, save: bool = False, plot: boo
         print("=" * 80)
 
         completed_df = df[(df["status"] == "COMPLETE") & (df["_primary_metric"].notna())].copy()
-        status_counts = df["status"].value_counts().to_dict()
-
         print("\n[ EXECUTION OVERVIEW ]")
         print(f"Total Trials Recorded : {len(df)}")
         print(f"Completed Trials     : {len(completed_df)}")
-        print(f"Pruned Trials        : {status_counts.get('PRUNED', 0)}")
 
+        if len(completed_df) == 0:
+            print("\nNo completed trials found in log. Exiting analysis.")
+            return
+        
         if "duration_sec" in df.columns and df["duration_sec"].notna().any():
             durations = df["duration_sec"].dropna()
             print(f"Mean Trial Duration  : {format_time(durations.mean())}")
             print(f"Min Trial Duration   : {format_time(durations.min())}")
             print(f"Max Trial Duration   : {format_time(durations.max())}")
 
-        if len(completed_df) == 0:
-            print("\nNo completed trials found in log. Exiting analysis.")
-            return
-
-        if not completed_df.empty:
-            best_row = completed_df.loc[completed_df["_primary_metric"].idxmin()]
-            best_cmd = generate_best_run_command(csv_path, best_row)
-            
-            print(f"\n[ BEST TRIAL COMMAND LINE ]\n{best_cmd}")
+        best_row = completed_df.loc[completed_df["_primary_metric"].idxmin()]
+        best_cmd = generate_best_run_command(csv_path, best_row)
+        print(f"\n[ BEST TRIAL COMMAND LINE ]\n{best_cmd}")
         
-
         print(f"\n[ TOP {top_k} BEST CONFIGURATIONS ]")
         top_trials = completed_df.sort_values(by="_primary_metric", ascending=True).head(top_k)
         
-        meta_cols = ["trial_num", "mean_rmse", "val_loss", "rmse_VAD", "duration_sec"]
+        meta_cols = ["trial_num", "rmse_overall", "mse_overall", "ccc_overall", "val_loss", "rmse_VAD", "mse_VAD", "ccc_VAD", "duration_sec"]
         meta_present = [c for c in meta_cols if c in top_trials.columns]
         
-        exclude_internal = {
-            "trial_num", "status", "val_loss", "duration_sec", "rmse_VAD", "_primary_metric",
+        exclude_internal =  meta_cols + [
             "rmse_Valence", "rmse_Arousal", "rmse_Dominance",
             "ccc_Valence", "ccc_Arousal", "ccc_Dominance",
             "_vad_pV", "_vad_pA", "_vad_pD"
-        }
+        ]
         hp_present = [c for c in top_trials.columns if c not in exclude_internal]
-        
         display_cols = meta_present + hp_present
         
         pd.set_option("display.max_columns", None)
@@ -643,130 +690,17 @@ def analyze_trials(csv_path: Path, top_k: int = 5, save: bool = False, plot: boo
         print(top_trials[display_cols].to_string(index=False))
 
         cat_cols, num_cols = get_parameter_lists(df)
-
         print_categorical_table(df, cat_cols)
         run_statistical_importance_test(df, cat_cols, num_cols)
         run_prune_propensity_test(df, cat_cols, num_cols)
-        if "_vad_pV" in df.columns and "_vad_pA" in df.columns and "_vad_pD" in df.columns:
-            run_joint_vad_analysis(df)
+        run_joint_vad_analysis(df)
+
         if plot:
             plot_interactive_ccc_vs_rmse(df, output_html=output_dir / f"{csv_path.stem}_ccc_vs_rmse_interactive.html")
 
-    finally:
-        if tee:
-            sys.stdout = tee.stdout
-            tee.close()
 
-
-
-def plot_interactive_ccc_vs_rmse(df: pd.DataFrame, output_html: Path):
-    """
-    Generates an interactive scatter plot of CCC vs RMSE with hover tooltips
-    showing all hyperparameters per trial. Saves output as an HTML file.
-    """
-    if 'mean_rmse' not in df.columns:
-        rmse_cols = [c for c in df.columns if c.startswith("rmse_overall_")]
-        if rmse_cols:
-            df["mean_rmse"] = df[rmse_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
-        elif "rmse_overall" in df.columns:
-            df["mean_rmse"] = pd.to_numeric(df["rmse_overall"], errors="coerce")
-
-    if 'mean_ccc' not in df.columns:
-        ccc_cols = [c for c in df.columns if c.startswith("ccc_overall_")]
-        if ccc_cols:
-            df["mean_ccc"] = df[ccc_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
-        elif "ccc_overall" in df.columns:
-            df["mean_ccc"] = pd.to_numeric(df["ccc_overall"], errors="coerce")
-
-    valid_df = df.dropna(subset=['mean_rmse', 'mean_ccc']).copy()
-    if valid_df.empty:
-        print("⚠️ No valid numeric data found for plotting.")
-        return
-
-    # Filter out non-hyperparameter columns for hover tooltips
-    exclude_cols = {
-        "_primary_metric", "_vad_pV", "_vad_pA", "_vad_pD", "mean_rmse", "mean_ccc", "trial_num", "status", "duration_sec", "val_loss", "rmse_VAD"
-    }
-    hp_cols = [
-        c for c in valid_df.columns 
-        if not c.startswith(("mse_", "rmse_", "ccc_", "pred_std_", "_")) and c not in exclude_cols
-    ]
-
-    fig = go.Figure()
-
-    status_config = {
-        'COMPLETE': {'color': '#2ca02c', 'symbol': 'circle', 'name': 'COMPLETE'},
-        'PRUNED': {'color': '#ff7f0e', 'symbol': 'triangle-up', 'name': 'PRUNED'}
-    }
-
-    for status, cfg in status_config.items():
-        sub_df = valid_df[valid_df['status'].astype(str).str.upper() == status]
-        if sub_df.empty:
-            continue
-
-        hover_text_list = []
-        for _, row in sub_df.iterrows():
-            trial_id = int(row['trial_num']) if 'trial_num' in row and pd.notna(row['trial_num']) else row.name
-            
-            # Format hover tooltip HTML
-            card = [
-                f"<b>Trial #{trial_id}</b> ({status})",
-                f"<b>Overall RMSE:</b> {row['mean_rmse']:.4f}",
-                f"<b>Overall CCC:</b> {row['mean_ccc']:.4f}",
-                f"<b>Duration:</b> {row['duration_sec']:.2f} seconds"
-            ]
-            if 'val_loss' in row and pd.notna(row['val_loss']) and str(row['val_loss']) != 'N/A':
-                card.append(f"<b>Val Loss:</b> {row['val_loss']}")
-            
-            card.append("")
-            card.append("<b>Hyperparameters:</b>")
-            for hp in hp_cols:
-                val = row[hp]
-                if pd.notna(val) and str(val) != 'N/A':
-                    card.append(f"• <i>{hp}:</i> {val}")
-
-            hover_text_list.append("<br>".join(card))
-
-        fig.add_trace(go.Scatter(
-            x=sub_df['mean_rmse'],
-            y=sub_df['mean_ccc'],
-            mode='markers+text',
-            name=cfg['name'],
-            text=[f"T{int(r['trial_num'])}" if 'trial_num' in r and pd.notna(r['trial_num']) else f"T{r.name}" for _, r in sub_df.iterrows()],
-            textposition="top center",
-            textfont=dict(size=10),
-            hoverinfo='text',
-            hovertext=hover_text_list,
-            marker=dict(
-                size=12,
-                color=cfg['color'],
-                symbol=cfg['symbol'],
-                line=dict(width=1, color='black'),
-                opacity=0.85
-            )
-        ))
-
-    fig.update_layout(
-        title=dict(
-            text="Interactive Optuna Trial Evaluation: CCC vs. RMSE",
-            font=dict(size=16, color="black")
-        ),
-        xaxis=dict(title="Overall RMSE (Lower is better)", gridcolor='#E5E5E5'),
-        yaxis=dict(title="Overall CCC (Higher is better)", gridcolor='#E5E5E5'),
-        template="plotly_white",
-        legend=dict(title="Trial Status", bordercolor="black", borderwidth=1),
-        hoverlabel=dict(bgcolor="white", font_size=12, font_family="Arial")
-    )
-
-    print("\n[ SAVING INTERACTIVE CCC vs RMSE PLOT ]")
-    if output_html:
-        fig.write_html(output_html)
-        print(f"Interactive HTML report saved to '{output_html}'")
-
-    return fig
-
-
-if __name__ == "__main__":
+def main():
+    """Main entry point for command-line execution."""
     parser = argparse.ArgumentParser(description="Analyze Optuna Trial CSV Logs")
     parser.add_argument("--csv_path", type=str, nargs="?", default=None, help="Optional path to trial CSV file")
     parser.add_argument("--search_dir", type=str, default="./output", help="Directory to search if csv_path is not specified")
@@ -781,18 +715,17 @@ if __name__ == "__main__":
     if args.csv_path:
         target_path = Path(args.csv_path)
         if not target_path.exists():
-            print(f"Error: File '{target_path}' not found.")
-            exit(1)
+            raise FileNotFoundError(f"Error: File '{target_path}' not found.")
         analyze_trials(target_path, top_k=args.top_k, save=args.save, plot=args.plot, output_dir=save_dir)
     else:
         search_path = Path(args.search_dir)
         discovered = discover_optuna_csvs(search_path)
-        
         if not discovered:
-            print(f"No Optuna trial CSVs found in '{search_path.resolve()}'.")
-            exit(1)
+            raise FileNotFoundError(f"No Optuna trial CSVs found in '{search_path.resolve()}'.")
             
-        print(f"Discovered {len(discovered)} Optuna CSV log file(s). Analyzing the latest:")
-        print(f" -> {discovered[0]}")
+        print(f"Discovered {len(discovered)} Optuna CSV log file(s). Analyzing all studies:")
         for study in discovered:
             analyze_trials(study, top_k=args.top_k, save=args.save, plot=args.plot, output_dir=save_dir)
+
+if __name__ == "__main__":
+    main()
