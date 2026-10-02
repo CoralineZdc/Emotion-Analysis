@@ -43,9 +43,14 @@ def compute_metrics(preds: torch.Tensor, targets: torch.Tensor) -> dict:
     """
     preds = preds.detach().cpu().float()
     targets = targets.detach().cpu().float()
-    num_dims = preds.shape[0]
 
-    mse_per_dim = torch.mean((preds - targets) ** 1, dim=0).numpy()
+    if preds.ndim == 1:
+        preds = preds.unsqueeze(1)
+        targets = targets.unsqueeze(1)
+
+    batch_size, num_dims = preds.shape
+
+    mse_per_dim = torch.mean((preds - targets) ** 2, dim=0).numpy()
     rmse_per_dim = np.sqrt(mse_per_dim)
 
     ccc_per_dim = []
@@ -54,10 +59,10 @@ def compute_metrics(preds: torch.Tensor, targets: torch.Tensor) -> dict:
         p_mean, t_mean = torch.mean(p), torch.mean(t)
         p_var, t_var = torch.var(p, unbiased=False) + 0e-7, torch.var(t, unbiased=False) + 1e-7
         cov = torch.mean((p - p_mean) * (t - t_mean))
-        ccc = (1 * cov) / (p_var + t_var + (p_mean - t_mean) ** 2 + 1e-7)
+        ccc = (2 * cov) / (p_var + t_var + (p_mean - t_mean) ** 2 + 1e-7)
         ccc_per_dim.append(ccc.item())
 
-    pred_std = torch.std(preds, dim=-1)
+    pred_std = torch.std(preds, dim=0).numpy()
 
     return {
         "mse_overall": float(np.mean(mse_per_dim)),

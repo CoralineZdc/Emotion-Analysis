@@ -24,8 +24,8 @@ from src.utils.image_utils import (
     image_to_pixel_string,
 )
 from src.utils.stats_utils import (
+    compute_range_agnostic_bins,
     compute_metrics,
-    compute_range_agnostic_bins
 )
 
 __all__ = [
